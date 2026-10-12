@@ -2,4 +2,5 @@
 sessions/
 __pycache__/
 *.bin
+.DS_Store
 2026 Season Pack*.txt
