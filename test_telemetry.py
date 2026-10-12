@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from decode_laps import (
+    WHEELS,
     filter_training_rows,
     find_braking_events,
     main as decode_laps_main,
@@ -446,6 +447,47 @@ class PacketAndOutputTests(unittest.TestCase):
         self.assertIn("tyre_wear_fl_pct", damage)
         self.assertIn("tyre_damage_fr_pct", damage)
         self.assertIn("tyre_blistering_rl_pct", damage)
+
+    def test_damage_decoder_maps_each_field_group_to_correct_wheel(self):
+        packet = make_packet(10, player=2)
+        offset = HEADER.size + 2 * 46
+        struct.pack_into(
+            "<4f12B", packet, offset,
+            1.25, 2.5, 3.75, 4.5,      # tyre wear: RL, RR, FL, FR
+            11, 12, 13, 14,            # tyre damage
+            21, 22, 23, 24,            # brake damage
+            31, 32, 33, 34,            # tyre blistering
+        )
+        damage = decode_damage(bytes(packet), 2)
+
+        expected = {
+            "tyre_wear_rl_pct": 1.25, "tyre_wear_rr_pct": 2.5,
+            "tyre_wear_fl_pct": 3.75, "tyre_wear_fr_pct": 4.5,
+            "tyre_damage_rl_pct": 11, "tyre_damage_rr_pct": 12,
+            "tyre_damage_fl_pct": 13, "tyre_damage_fr_pct": 14,
+            "brake_damage_rl_pct": 21, "brake_damage_rr_pct": 22,
+            "brake_damage_fl_pct": 23, "brake_damage_fr_pct": 24,
+            "tyre_blistering_rl_pct": 31, "tyre_blistering_rr_pct": 32,
+            "tyre_blistering_fl_pct": 33, "tyre_blistering_fr_pct": 34,
+        }
+        self.assertEqual(damage, expected)
+
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=SAMPLE_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: damage.get(field, "") for field in SAMPLE_FIELDS})
+        output.seek(0)
+        csv_row = next(csv.DictReader(output))
+        for wheel, value in zip(WHEELS, (21, 22, 23, 24)):
+            self.assertEqual(csv_row[f"brake_damage_{wheel}_pct"], str(value))
+
+    def test_brake_damage_columns_are_in_sample_fields(self):
+        from decode_laps import SAMPLE_FIELDS as OFFLINE_FIELDS
+
+        for wheel in WHEELS:
+            field = f"brake_damage_{wheel}_pct"
+            self.assertIn(field, SAMPLE_FIELDS)
+            self.assertIn(field, OFFLINE_FIELDS)
 
     def test_lap_decoder_preserves_distance_time_and_invalid_flag(self):
         decoded = decode_lap(lap_packet(

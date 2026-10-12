@@ -44,7 +44,7 @@ for wheel in WHEELS:
         f"tyre_surface_temp_{wheel}_c", f"tyre_inner_temp_{wheel}_c",
         f"tyre_pressure_{wheel}_psi", f"brake_temp_{wheel}_c",
         f"tyre_wear_{wheel}_pct", f"tyre_damage_{wheel}_pct",
-        f"tyre_blistering_{wheel}_pct",
+        f"brake_damage_{wheel}_pct", f"tyre_blistering_{wheel}_pct",
     ])
 for wheel in WHEELS:
     SAMPLE_FIELDS.append(f"surface_type_{wheel}")
