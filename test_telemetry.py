@@ -485,10 +485,11 @@ class PacketAndOutputTests(unittest.TestCase):
 
     def test_pipeline_synchronizes_lap_and_latest_telemetry(self):
         pipeline = PipelineState()
-        pipeline.process(telemetry_packet(speed=225, frame=1))
-        result = pipeline.process(lap_packet(frame=1))
+        pipeline.process(lap_packet(frame=1))
+        result = pipeline.process(telemetry_packet(speed=225, frame=1))
         if result is None:
-            self.fail("Lap packet should produce a sample")
+            self.fail("Telemetry packet should produce a sample when lap data is available")
+        self.assertEqual(result["kind"], "telemetry")
         self.assertEqual(result["speed_kmh"], 225)
         self.assertEqual(result["segment_id"], 1)
         self.assertEqual(result["segment_sample_index"], 0)
@@ -496,11 +497,15 @@ class PacketAndOutputTests(unittest.TestCase):
     def test_pipeline_records_flashback_as_diagnostic_event(self):
         pipeline = PipelineState()
         pipeline.process(lap_packet(frame=1))
+        pipeline.process(telemetry_packet(frame=1))
         result = pipeline.process(flashback_packet(target_frame=1, target_time=1))
         if result is None:
             self.fail("Flashback packet should produce a diagnostic event")
         self.assertEqual(result["kind"], "flashback")
-        self.assertEqual(pipeline.lap_states[(1, 0)].segments[0]["segment_end_reason"], "flashback")
+        tracker = pipeline.lap_states[(1, 0)]
+        self.assertEqual(tracker.segments[0]["segment_end_reason"], "flashback")
+        self.assertEqual(len(tracker.flashback_events), 1)
+        self.assertEqual(tracker.flashback_events[0]["target_frame_id"], 1)
 
     def test_live_sample_keeps_motion_and_component_timestamps(self):
         meta = packet_meta(telemetry_packet(frame=4))
