@@ -1,3 +1,5 @@
 .venv/
 sessions/
 __pycache__/
+*.bin
+2026 Season Pack*.txt
