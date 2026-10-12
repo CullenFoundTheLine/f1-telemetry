@@ -21,6 +21,14 @@ PACKET_SIZES_2026 = {
     15: 1231,
     16: 269,
 }
+WEATHER_LABELS = {
+    0: "clear",
+    1: "light_cloud",
+    2: "overcast",
+    3: "light_rain",
+    4: "heavy_rain",
+    5: "storm",
+}
 
 TELEMETRY_CAR = struct.Struct("<HfffBbHBBH4H4B4BB4f4B")
 MOTION_CAR = struct.Struct("<6f9h3f")
@@ -94,6 +102,27 @@ def valid_packet(packet: bytes, expected_format: int, packet_id: int) -> bool:
     if expected_format == 2025:
         return packet_id == 6 and len(packet) == 1352
     return False
+
+
+def decode_session(packet: bytes) -> dict:
+    weather_code, track_temp, air_temp, total_laps, track_length, session_type, track_id = (
+        struct.unpack_from("<BbbBHBb", packet, 29)
+    )
+    safety_car_status = struct.unpack_from("<B", packet, 153)[0]
+    sector2_start, sector3_start = struct.unpack_from("<ff", packet, 745)
+    return {
+        "weather_code": weather_code,
+        "weather_label": WEATHER_LABELS.get(weather_code, "unknown"),
+        "track_temp_c": track_temp,
+        "air_temp_c": air_temp,
+        "total_laps": total_laps,
+        "track_length_m": track_length,
+        "session_type_code": session_type,
+        "track_id": track_id,
+        "safety_car_status": safety_car_status,
+        "sector2_start_m": sector2_start,
+        "sector3_start_m": sector3_start,
+    }
 
 
 def decode_telemetry(packet: bytes, player_index: int) -> dict:

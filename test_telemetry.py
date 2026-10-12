@@ -28,6 +28,7 @@ from telemetry_common import (
     decode_damage,
     decode_lap,
     decode_motion,
+    decode_session,
     decode_status,
     decode_telemetry,
     packet_meta,
@@ -433,6 +434,35 @@ class PacketAndOutputTests(unittest.TestCase):
             packet = make_packet(packet_id)
             self.assertEqual(len(packet), size)
             self.assertTrue(valid_packet(bytes(packet), 2026, packet_id))
+
+    def test_session_decoder_reads_session_fields(self):
+        packet = make_packet(1)
+        struct.pack_into("<BbbBHBb", packet, 29, 3, 31, 22, 57, 5278, 10, 7)
+        struct.pack_into("<B", packet, 153, 2)
+        struct.pack_into("<ff", packet, 745, 1500.5, 3200.25)
+
+        self.assertEqual(decode_session(bytes(packet)), {
+            "weather_code": 3,
+            "weather_label": "light_rain",
+            "track_temp_c": 31,
+            "air_temp_c": 22,
+            "total_laps": 57,
+            "track_length_m": 5278,
+            "session_type_code": 10,
+            "track_id": 7,
+            "safety_car_status": 2,
+            "sector2_start_m": 1500.5,
+            "sector3_start_m": 3200.25,
+        })
+
+    def test_session_decoder_preserves_unknown_weather_code(self):
+        packet = make_packet(1)
+        packet[29] = 9
+
+        decoded = decode_session(bytes(packet))
+
+        self.assertEqual(decoded["weather_code"], 9)
+        self.assertEqual(decoded["weather_label"], "unknown")
 
     def test_telemetry_motion_status_and_damage_decoders_preserve_fields(self):
         telemetry = telemetry_packet()
