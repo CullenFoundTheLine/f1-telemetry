@@ -213,7 +213,8 @@ def decode_damage(packet: bytes, player_index: int) -> dict:
     for wheel, index in (("rl", 0), ("rr", 1), ("fl", 2), ("fr", 3)):
         result[f"tyre_wear_{wheel}_pct"] = values[index]
         result[f"tyre_damage_{wheel}_pct"] = values[4 + index]
-        result[f"tyre_blistering_{wheel}_pct"] = values[8 + index]
+        result[f"brake_damage_{wheel}_pct"] = values[8 + index]
+        result[f"tyre_blistering_{wheel}_pct"] = values[12 + index]
     return result
 
 
