@@ -10,6 +10,7 @@ from telemetry_common import (
     decode_flashback,
     decode_lap,
     decode_motion,
+    decode_session,
     decode_status,
     decode_telemetry,
     packet_meta,
@@ -37,6 +38,10 @@ SAMPLE_FIELDS = [
     "motion_received_ns", "telemetry_frame_id", "telemetry_received_ns",
     "status_frame_id", "status_received_ns", "damage_frame_id", "damage_received_ns",
     "tyre_compound_actual", "tyre_compound_visual", "tyre_age_laps",
+    "weather_code", "weather_label", "track_temp_c", "air_temp_c",
+    "total_laps", "track_length_m", "session_type_code", "track_id",
+    "safety_car_status", "sector2_start_m", "sector3_start_m",
+    "session_frame_id", "session_received_ns",
     "lap_continuous", "segment_valid", "training_eligible", "exclusion_reason",
 ]
 for wheel in WHEELS:
@@ -110,6 +115,7 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
     latest_status = {}
     latest_damage = {}
     latest_telemetry = {}
+    latest_session = {}
     trackers = {}
 
     with binary_path.open("rb") as file:
@@ -128,6 +134,13 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
 
             meta = packet_meta(packet)
             if meta is None or meta.packet_format != 2026 or meta.packet_version != 1:
+                continue
+            if meta.packet_id == 1 and valid_2026_packet(packet, 1):
+                latest_session[meta.session_uid] = {
+                    **decode_session(packet),
+                    "session_frame_id": meta.frame_id,
+                    "session_received_ns": received_ns,
+                }
                 continue
             if meta.player_index >= 24:
                 continue
@@ -188,6 +201,7 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
                     **latest_status.get(key, {}),
                     **latest_damage.get(key, {}),
                     **latest_telemetry.get(key, {}),
+                    **latest_session.get(meta.session_uid, {}),
                 }
                 tracker = trackers.setdefault(key, LapTracker(*key))
                 sample, _ = tracker.process_sample(sample)

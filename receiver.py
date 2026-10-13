@@ -23,6 +23,7 @@ from telemetry_common import (
     decode_legacy_telemetry,
     decode_lap,
     decode_motion,
+    decode_session,
     decode_status,
     decode_telemetry,
     packet_meta,
@@ -67,7 +68,8 @@ def blank_values() -> dict[str, object]:
 
 
 def build_telemetry_row(
-    received_ns, meta, lap, status, damage, decoded_telemetry, motion=None
+    received_ns, meta, lap, status, damage, decoded_telemetry, motion=None,
+    session=None,
 ):
     values = blank_values()
     values.update({
@@ -82,6 +84,7 @@ def build_telemetry_row(
         **(motion or {}),
         **status,
         **damage,
+        **(session or {}),
         **decoded_telemetry,
     })
     values["received_ns"] = received_ns
@@ -152,6 +155,7 @@ def main():
     latest_status = {}
     latest_damage = {}
     latest_telemetry = {}
+    latest_session = {}
     previous_brake = 0.0
     previous_brake_key = None
     sample_count = 0
@@ -206,7 +210,7 @@ def main():
                     if meta.packet_format not in FORMATS or meta.packet_version != 1:
                         continue
                     car_count, _, _ = FORMATS[meta.packet_format]
-                    if not 0 <= meta.player_index < car_count:
+                    if meta.packet_id != 1 and not 0 <= meta.player_index < car_count:
                         continue
 
                     if meta.packet_format == 2025 and valid_packet(packet, 2025, 6):
@@ -227,6 +231,14 @@ def main():
                         sample_count += 1
                         continue
                     if meta.packet_format != 2026 or not valid_packet(packet, 2026, meta.packet_id):
+                        continue
+
+                    if meta.packet_id == 1:
+                        latest_session[meta.session_uid] = {
+                            **decode_session(packet),
+                            "session_frame_id": meta.frame_id,
+                            "session_received_ns": received_ns,
+                        }
                         continue
 
                     key = (meta.session_uid, meta.player_index)
@@ -294,6 +306,7 @@ def main():
                             latest_damage.get(key, {}),
                             latest_telemetry[key],
                             latest_motion.get(key, {}),
+                            latest_session.get(meta.session_uid, {}),
                         )
                         values, completed = tracker.process_sample(values)
                         if values is None:

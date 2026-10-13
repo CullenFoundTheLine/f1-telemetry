@@ -8,6 +8,7 @@ from telemetry_common import (
     decode_flashback,
     decode_lap,
     decode_motion,
+    decode_session,
     decode_status,
     decode_telemetry,
     packet_meta,
@@ -24,13 +25,22 @@ class PipelineState:
     latest_damage: dict = field(default_factory=dict)
     latest_telemetry: dict = field(default_factory=dict)
     latest_setup: dict = field(default_factory=dict)
+    latest_session: dict = field(default_factory=dict)
 
     def process(self, packet: bytes, received_ns: int = 0) -> Optional[dict]:
         meta = packet_meta(packet)
         if meta is None or not valid_packet(packet, 2026, meta.packet_id):
             return None
-        if not 0 <= meta.player_index < 24:
+        if meta.packet_id != 1 and not 0 <= meta.player_index < 24:
             return None
+        if meta.packet_id == 1:
+            session = {
+                **decode_session(packet),
+                "session_frame_id": meta.frame_id,
+                "session_received_ns": received_ns,
+            }
+            self.latest_session[meta.session_uid] = session
+            return {"kind": "session", **session}
         key = (meta.session_uid, meta.player_index)
         if meta.packet_id == 3:
             event = decode_flashback(packet)
@@ -88,6 +98,7 @@ class PipelineState:
                 **self.latest_motion.get(key, {}),
                 **self.latest_status.get(key, {}),
                 **self.latest_damage.get(key, {}),
+                **self.latest_session.get(meta.session_uid, {}),
                 **telemetry,
                 "session_uid": meta.session_uid,
                 "vehicle_index": meta.player_index,
@@ -119,8 +130,7 @@ class PipelineState:
             }
             self.latest_damage[key] = damage
             return {"kind": "damage", **damage}
-        # TODO: Decode Session and Car Setup packets from their documented
-        # structures before adding weather, track, fuel, safety-car, or setup data.
+        # TODO: Decode Car Setup packets from their documented structures.
         return {"kind": "other", "packet_id": meta.packet_id}
 
     def snapshot(self, session_uid: int, vehicle_index: int) -> dict:

@@ -566,6 +566,45 @@ class PacketAndOutputTests(unittest.TestCase):
         self.assertEqual(result["segment_id"], 1)
         self.assertEqual(result["segment_sample_index"], 0)
 
+    def test_pipeline_attaches_latest_shared_session_data(self):
+        session_packet = make_packet(1, session=7, frame=3)
+        struct.pack_into("<BbbBHBb", session_packet, 29, 4, 32, 21, 58, 5300, 10, 7)
+        struct.pack_into("<B", session_packet, 153, 2)
+        struct.pack_into("<ff", session_packet, 745, 1500.5, 3200.25)
+        pipeline = PipelineState()
+        pipeline.process(bytes(session_packet), received_ns=300)
+        pipeline.process(lap_packet(session=7, frame=4))
+
+        result = pipeline.process(
+            telemetry_packet(session=7, speed=225, frame=5), received_ns=500
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["kind"], "telemetry")
+        self.assertEqual(result["weather_code"], 4)
+        self.assertEqual(result["track_id"], 7)
+        self.assertEqual(result["session_frame_id"], 3)
+
+    def test_pipeline_leaves_session_fields_absent_without_session_packet(self):
+        pipeline = PipelineState()
+        pipeline.process(lap_packet(frame=1))
+
+        result = pipeline.process(telemetry_packet(speed=225, frame=2))
+
+        self.assertIsNotNone(result)
+        self.assertIn(result.get("weather_code"), (None, ""))
+        self.assertIn(result.get("weather_label", ""), (None, ""))
+
+    def test_sample_fields_include_shared_session_columns(self):
+        session_fields = (
+            "weather_code", "weather_label", "track_temp_c", "air_temp_c",
+            "total_laps", "track_length_m", "session_type_code", "track_id",
+            "safety_car_status", "sector2_start_m", "sector3_start_m",
+            "session_frame_id", "session_received_ns",
+        )
+        for field in session_fields:
+            self.assertIn(field, SAMPLE_FIELDS)
+
     def test_pipeline_records_flashback_as_diagnostic_event(self):
         pipeline = PipelineState()
         pipeline.process(lap_packet(frame=1))
@@ -645,6 +684,28 @@ class PacketAndOutputTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["lap_number"], 1)
         self.assertEqual(rows[0]["speed_kmh"], 175)
+
+    def test_raw_decoder_attaches_session_packet_to_telemetry_row(self):
+        session_packet = make_packet(1, session=3, frame=1)
+        struct.pack_into("<BbbBHBb", session_packet, 29, 3, 31, 22, 57, 5278, 10, 7)
+        struct.pack_into("<B", session_packet, 153, 2)
+        struct.pack_into("<ff", session_packet, 745, 1500.5, 3200.25)
+        packets = [
+            bytes(session_packet),
+            lap_packet(session=3, frame=2),
+            telemetry_packet(session=3, speed=201, frame=3),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "raw.bin"
+            path.write_bytes(b"".join(
+                struct.pack("<QI", index, len(packet)) + packet
+                for index, packet in enumerate(packets, start=1)
+            ))
+
+            rows = read_recording(path)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["weather_code"], 3)
 
     def test_offline_decoder_writes_only_complete_laps_to_training_csv(self):
         packets = [
