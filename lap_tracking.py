@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from telemetry_common import classify_compound, classify_weather, lap_condition_class
+
 
 FRAME_REGRESSION_THRESHOLD = 5
 SESSION_TIME_REGRESSION_TOLERANCE_S = 0.05
@@ -297,6 +299,10 @@ class LapTracker:
         self.lap_start_known = False
         self.lap_segment_count = 0
         self.low_speed_s = 0.0
+        self.weather_codes_seen = set()
+        self.weather_classes_seen = set()
+        self.compound_codes_seen = set()
+        self.compound_classes_seen = set()
         self.previous_sample: Optional[dict] = None
         self.pending_start_reason = "session_start"
 
@@ -313,6 +319,40 @@ class LapTracker:
         self.lap_start_known = known_start
         self.lap_segment_count = 0
         self.low_speed_s = 0.0
+        self.weather_codes_seen = set()
+        self.weather_classes_seen = set()
+        self.compound_codes_seen = set()
+        self.compound_classes_seen = set()
+
+    @staticmethod
+    def _codes_seen_string(codes):
+        def sort_key(code):
+            try:
+                return (0, int(code))
+            except ValueError:
+                return (1, code)
+
+        return "|".join(sorted(codes, key=sort_key))
+
+    def _record_lap_conditions(self, sample):
+        weather_code = sample.get("weather_code")
+        compound_code = sample.get("tyre_compound_actual")
+        self.weather_classes_seen.add(classify_weather(weather_code))
+        self.compound_classes_seen.add(classify_compound(compound_code))
+        if weather_code not in (None, ""):
+            self.weather_codes_seen.add(str(weather_code).strip())
+        if compound_code not in (None, ""):
+            self.compound_codes_seen.add(str(compound_code).strip())
+
+    def _lap_condition_fields(self):
+        return {
+            "weather_codes_seen": self._codes_seen_string(self.weather_codes_seen),
+            "weather_changed_in_lap": len(self.weather_codes_seen) > 1,
+            "compound_codes_seen": self._codes_seen_string(self.compound_codes_seen),
+            "condition_class": lap_condition_class(
+                self.weather_classes_seen, self.compound_classes_seen
+            ),
+        }
 
     def _complete_lap(self, sample):
         complete = self.continuous and self.lap_start_known
@@ -330,6 +370,7 @@ class LapTracker:
             "exclusion_reason": self.exclusion_reason or (
                 "discontinuity" if not self.continuous else ""
             ),
+            **self._lap_condition_fields(),
         }
         self.summaries.append(summary)
         return summary
@@ -412,6 +453,7 @@ class LapTracker:
             )
 
         if self.active:
+            self._record_lap_conditions(sample)
             previous_time = self.previous_sample.get("session_time_s") if self.previous_sample else None
             current_session_time = sample.get("session_time_s")
             elapsed = 0.0
@@ -472,5 +514,6 @@ class LapTracker:
                 "training_eligible": False,
                 "segment_count": self.lap_segment_count,
                 "exclusion_reason": self.exclusion_reason or "recording_end",
+                **self._lap_condition_fields(),
             })
             self.active = False

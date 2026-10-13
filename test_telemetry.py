@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from decode_laps import (
+    LAP_SUMMARY_FIELDS,
     WHEELS,
     filter_training_rows,
     find_braking_events,
@@ -31,6 +32,9 @@ from telemetry_common import (
     decode_session,
     decode_status,
     decode_telemetry,
+    classify_compound,
+    classify_weather,
+    lap_condition_class,
     packet_meta,
     valid_packet,
 )
@@ -219,6 +223,78 @@ class DiscontinuityTests(unittest.TestCase):
 
 
 class LapAndSegmentTests(unittest.TestCase):
+    def test_condition_classification_helpers(self):
+        self.assertEqual(classify_weather(0), "dry")
+        self.assertEqual(classify_weather(2), "dry")
+        self.assertEqual(classify_weather(3), "wet")
+        self.assertEqual(classify_weather(5), "wet")
+        for code in (9, "", None):
+            self.assertEqual(classify_weather(code), "unknown")
+        self.assertEqual(classify_compound(16), "dry")
+        self.assertEqual(classify_compound(22), "dry")
+        self.assertEqual(classify_compound(7), "intermediate")
+        self.assertEqual(classify_compound(8), "wet")
+        for code in (99, "", None):
+            self.assertEqual(classify_compound(code), "unknown")
+        self.assertEqual(lap_condition_class({"dry"}, {"dry"}), "dry")
+        self.assertEqual(lap_condition_class({"unknown"}, {"dry"}), "unknown")
+
+    def test_lap_summary_classifies_stable_dry_conditions(self):
+        tracker = LapTracker(1, 0)
+        tracker.process_sample(make_sample(
+            lap=1, current=0.5, frame=1, weather_code=0,
+            tyre_compound_actual=18,
+        ))
+        _, completed = tracker.process_sample(make_sample(
+            lap=2, current=0.2, last=92.0, frame=2,
+            session_time=10.016, weather_code=0, tyre_compound_actual=18,
+        ))
+        self.assertEqual(completed["condition_class"], "dry")
+        self.assertFalse(completed["weather_changed_in_lap"])
+
+    def test_lap_summary_detects_weather_change_to_wet(self):
+        tracker = LapTracker(1, 0)
+        tracker.process_sample(make_sample(
+            lap=1, current=0.5, frame=1, weather_code=0,
+            tyre_compound_actual=18,
+        ))
+        tracker.process_sample(make_sample(
+            lap=1, current=20.0, frame=2, session_time=10.016,
+            weather_code=3, tyre_compound_actual=18,
+        ))
+        _, completed = tracker.process_sample(make_sample(
+            lap=2, current=0.2, last=92.0, frame=3,
+            session_time=10.032, weather_code=3, tyre_compound_actual=18,
+        ))
+        self.assertTrue(completed["weather_changed_in_lap"])
+        self.assertEqual(completed["weather_codes_seen"], "0|3")
+        self.assertEqual(completed["condition_class"], "wet")
+
+    def test_lap_summary_classifies_intermediate_compound_as_wet(self):
+        tracker = LapTracker(1, 0)
+        tracker.process_sample(make_sample(
+            lap=1, current=0.5, frame=1, weather_code=0,
+            tyre_compound_actual=7,
+        ))
+        _, completed = tracker.process_sample(make_sample(
+            lap=2, current=0.2, last=92.0, frame=2,
+            session_time=10.016, weather_code=0, tyre_compound_actual=7,
+        ))
+        self.assertEqual(completed["condition_class"], "wet")
+
+    def test_lap_without_weather_is_unknown_and_summary_fields_are_defined(self):
+        tracker = LapTracker(1, 0)
+        tracker.process_sample(make_sample(lap=1, current=0.5, frame=1))
+        _, completed = tracker.process_sample(make_sample(
+            lap=2, current=0.2, last=92.0, frame=2, session_time=10.016,
+        ))
+        self.assertEqual(completed["condition_class"], "unknown")
+        for field in (
+            "weather_codes_seen", "weather_changed_in_lap",
+            "compound_codes_seen", "condition_class",
+        ):
+            self.assertIn(field, LAP_SUMMARY_FIELDS)
+
     def test_uninterrupted_lap_completes_once_with_one_segment(self):
         tracker = LapTracker(1, 0)
         tracker.process_sample(make_sample(lap=1, current=0.5, frame=1))

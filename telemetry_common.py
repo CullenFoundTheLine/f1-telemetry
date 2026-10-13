@@ -125,6 +125,48 @@ def decode_session(packet: bytes) -> dict:
     }
 
 
+def _numeric_code(code):
+    if code is None or code == "" or isinstance(code, bool):
+        return None
+    try:
+        value = int(code)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not isinstance(code, str) and value != code:
+        return None
+    return value
+
+
+def classify_weather(code) -> str:
+    value = _numeric_code(code)
+    if value in (0, 1, 2):
+        return "dry"
+    if value in (3, 4, 5):
+        return "wet"
+    return "unknown"
+
+
+def classify_compound(code) -> str:
+    value = _numeric_code(code)
+    if value in (16, 17, 18, 19, 20, 21, 22):
+        return "dry"
+    if value == 7:
+        return "intermediate"
+    if value == 8:
+        return "wet"
+    return "unknown"
+
+
+def lap_condition_class(weather_classes, compound_classes) -> str:
+    if weather_classes == {"dry"} and compound_classes == {"dry"}:
+        return "dry"
+    if "wet" in weather_classes or compound_classes.intersection(
+        {"intermediate", "wet"}
+    ):
+        return "wet"
+    return "unknown"
+
+
 def decode_telemetry(packet: bytes, player_index: int) -> dict:
     values = TELEMETRY_CAR.unpack_from(
         packet, HEADER.size + player_index * TELEMETRY_CAR.size

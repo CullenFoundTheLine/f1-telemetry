@@ -57,7 +57,8 @@ for wheel in WHEELS:
 LAP_SUMMARY_FIELDS = [
     "session_uid", "vehicle_index", "lap_number", "lap_time_s", "valid",
     "complete", "continuous", "training_eligible", "segment_count",
-    "exclusion_reason",
+    "exclusion_reason", "weather_codes_seen", "weather_changed_in_lap",
+    "compound_codes_seen", "condition_class",
 ]
 SEGMENT_FIELDS = [
     "session_uid", "vehicle_index", "lap_number", "segment_id",
