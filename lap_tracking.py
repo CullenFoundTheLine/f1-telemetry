@@ -347,7 +347,7 @@ class LapTracker:
     def _lap_condition_fields(self):
         return {
             "weather_codes_seen": self._codes_seen_string(self.weather_codes_seen),
-            "weather_changed_in_lap": len(self.weather_codes_seen) > 1,
+            "weather_changed_in_lap": len(self.weather_classes_seen) > 1,
             "compound_codes_seen": self._codes_seen_string(self.compound_codes_seen),
             "condition_class": lap_condition_class(
                 self.weather_classes_seen, self.compound_classes_seen
@@ -357,6 +357,13 @@ class LapTracker:
     def _complete_lap(self, sample):
         complete = self.continuous and self.lap_start_known
         valid = complete and not self.invalid
+        conditions = self._lap_condition_fields()
+        conditions_known = conditions["condition_class"] in {"dry", "wet"}
+        exclusion_reason = self.exclusion_reason
+        if not exclusion_reason and not self.continuous:
+            exclusion_reason = "discontinuity"
+        elif not exclusion_reason and valid and not conditions_known:
+            exclusion_reason = "unknown_or_inconsistent_conditions"
         summary = {
             "session_uid": self.session_uid,
             "vehicle_index": self.vehicle_index,
@@ -365,12 +372,10 @@ class LapTracker:
             "valid": valid,
             "complete": complete,
             "continuous": self.continuous,
-            "training_eligible": valid,
+            "training_eligible": valid and conditions_known,
             "segment_count": self.lap_segment_count,
-            "exclusion_reason": self.exclusion_reason or (
-                "discontinuity" if not self.continuous else ""
-            ),
-            **self._lap_condition_fields(),
+            "exclusion_reason": exclusion_reason,
+            **conditions,
         }
         self.summaries.append(summary)
         return summary

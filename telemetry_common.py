@@ -1,4 +1,5 @@
 import struct
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
 
@@ -50,6 +51,49 @@ CAR_SETUP_FIELDS = [
     "received_ns", "session_uid", "session_time_s", "frame_id",
     "overall_frame_id", "vehicle_index",
 ] + CAR_SETUP_VALUE_FIELDS + ["next_front_wing_value"]
+
+FRAME_JOIN_STREAMS = frozenset({"lap", "motion", "status", "telemetry"})
+
+
+class FramePacketJoiner:
+    """Join the four per-car streams that describe the same simulation frame."""
+
+    def __init__(self, max_pending_frames=120):
+        self.max_pending_frames = max_pending_frames
+        self.pending = {}
+
+    def add(self, session_uid, vehicle_index, frame_id, stream, values):
+        if stream not in FRAME_JOIN_STREAMS:
+            raise ValueError(f"Unsupported frame-joined stream: {stream}")
+        car_key = (session_uid, vehicle_index)
+        pending_for_car = self.pending.setdefault(car_key, OrderedDict())
+        frame_values = pending_for_car.setdefault(frame_id, {})
+        frame_values[stream] = dict(values)
+        pending_for_car.move_to_end(frame_id)
+
+        if FRAME_JOIN_STREAMS.issubset(frame_values):
+            joined = pending_for_car.pop(frame_id)
+            if not pending_for_car:
+                self.pending.pop(car_key)
+            return joined
+
+        while len(pending_for_car) > self.max_pending_frames:
+            pending_for_car.popitem(last=False)
+        return None
+
+
+def latest_with_frame_age(values, prefix, current_overall_frame_id):
+    """Copy one latest-value cache entry and report its age in overall frames."""
+    result = dict(values)
+    source_overall_frame_id = result.pop("_overall_frame_id", None)
+    if (
+        source_overall_frame_id is not None
+        and current_overall_frame_id is not None
+    ):
+        result[f"{prefix}_age_frames"] = (
+            current_overall_frame_id - source_overall_frame_id
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -160,8 +204,10 @@ def classify_compound(code) -> str:
 def lap_condition_class(weather_classes, compound_classes) -> str:
     if weather_classes == {"dry"} and compound_classes == {"dry"}:
         return "dry"
-    if "wet" in weather_classes or compound_classes.intersection(
-        {"intermediate", "wet"}
+    if (
+        weather_classes == {"wet"}
+        and compound_classes
+        and compound_classes.issubset({"intermediate", "wet"})
     ):
         return "wet"
     return "unknown"

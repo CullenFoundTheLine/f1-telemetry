@@ -17,6 +17,7 @@ from lap_tracking import LapTracker
 from session_manifest import write_session_manifest
 from telemetry_common import (
     CAR_SETUP_FIELDS,
+    FramePacketJoiner,
     decode_car_setup,
     decode_damage,
     decode_flashback,
@@ -26,6 +27,7 @@ from telemetry_common import (
     decode_session,
     decode_status,
     decode_telemetry,
+    latest_with_frame_age,
     packet_meta,
     valid_packet,
 )
@@ -69,7 +71,7 @@ def blank_values() -> dict[str, object]:
 
 def build_telemetry_row(
     received_ns, meta, lap, status, damage, decoded_telemetry, motion=None,
-    session=None,
+    session=None, setup=None,
 ):
     values = blank_values()
     values.update({
@@ -83,9 +85,10 @@ def build_telemetry_row(
         **lap,
         **(motion or {}),
         **status,
-        **damage,
-        **(session or {}),
         **decoded_telemetry,
+        **latest_with_frame_age(damage or {}, "damage", meta.overall_frame_id),
+        **latest_with_frame_age(setup or {}, "setup", meta.overall_frame_id),
+        **latest_with_frame_age(session or {}, "session", meta.overall_frame_id),
     })
     values["received_ns"] = received_ns
     values["lap_received_ns"] = lap.get("lap_received_ns", received_ns)
@@ -107,11 +110,6 @@ def build_braking_event(values, previous_brake, previous_key, threshold_pct=5.0)
     if brake >= threshold_pct and previous_brake < threshold_pct:
         event = {field: values.get(field, "") for field in BRAKING_FIELDS}
     return event, brake, key
-
-
-def add_latest(target, key, source):
-    if source:
-        target[key] = dict(source)
 
 
 def _write_live_rows(file, fields, rows):
@@ -150,12 +148,10 @@ def main():
     receiver.bind(("0.0.0.0", PORT))
     receiver.settimeout(5)
     trackers = {}
-    latest_lap = {}
-    latest_motion = {}
-    latest_status = {}
     latest_damage = {}
-    latest_telemetry = {}
+    latest_setup = {}
     latest_session = {}
+    frame_joiner = FramePacketJoiner()
     previous_brake = 0.0
     previous_brake_key = None
     sample_count = 0
@@ -189,6 +185,47 @@ def main():
             _write_live_rows(lap_file, LAP_SUMMARY_FIELDS, [])
             _write_live_rows(segments_file, SEGMENT_FIELDS, [])
             _write_live_rows(flashback_file, FLASHBACK_FIELDS, [])
+
+            def emit_joined_sample(meta, received_ns, joined):
+                nonlocal previous_brake, previous_brake_key, sample_count
+                key = (meta.session_uid, meta.player_index)
+                tracker = trackers.setdefault(key, LapTracker(*key))
+                values = build_telemetry_row(
+                    received_ns,
+                    meta,
+                    joined["lap"],
+                    joined["status"],
+                    latest_damage.get(key, {}),
+                    joined["telemetry"],
+                    joined["motion"],
+                    latest_session.get(meta.session_uid, {}),
+                    latest_setup.get(key, {}),
+                )
+                values, completed = tracker.process_sample(values)
+                if values is None:
+                    return
+                telemetry_writer.writerow({
+                    field: values.get(field, "") for field in SAMPLE_FIELDS
+                })
+                position_writer.writerow({
+                    field: values.get(field, "") for field in POSITION_FIELDS
+                })
+                braking_event, previous_brake, previous_brake_key = build_braking_event(
+                    values, previous_brake, previous_brake_key
+                )
+                if braking_event is not None:
+                    braking_writer.writerow(braking_event)
+                sample_count += 1
+                write_live_summaries(lap_file, trackers)
+                write_live_segments(segments_file, trackers)
+                if sample_count % 60 == 0:
+                    telemetry_file.flush()
+                    position_file.flush()
+                    lap_file.flush()
+                    segments_file.flush()
+                    braking_file.flush()
+                    flashback_file.flush()
+                    setup_file.flush()
 
             try:
                 while True:
@@ -238,6 +275,7 @@ def main():
                             **decode_session(packet),
                             "session_frame_id": meta.frame_id,
                             "session_received_ns": received_ns,
+                            "_overall_frame_id": meta.overall_frame_id,
                         }
                         continue
 
@@ -259,27 +297,33 @@ def main():
                             "motion_received_ns": received_ns,
                             "motion_frame_id": meta.frame_id,
                         }
-                        add_latest(latest_motion, key, motion)
-                        lap = latest_lap.get(key, {})
-                        position_writer.writerow({
-                            "received_ns": received_ns,
-                            "session_uid": meta.session_uid,
-                            "frame_id": meta.frame_id,
-                            "overall_frame_id": meta.overall_frame_id,
-                            "vehicle_index": meta.player_index,
-                            "lap_number": lap.get("lap_number", ""),
-                            "lap_distance_m": lap.get("lap_distance_m", ""),
-                            "position": lap.get("position", ""),
-                            **decode_motion(packet, meta.player_index),
-                        })
+                        joined = frame_joiner.add(
+                            meta.session_uid, meta.player_index, meta.frame_id,
+                            "motion", motion,
+                        )
+                        if joined is not None:
+                            emit_joined_sample(meta, received_ns, joined)
                     elif meta.packet_id == 2:
-                        latest_lap[key] = {
+                        lap = {
                             **decode_lap(packet, meta.player_index),
-                            "session_uid": meta.session_uid,
                             "lap_received_ns": received_ns,
                             "lap_frame_id": meta.frame_id,
                         }
+                        joined = frame_joiner.add(
+                            meta.session_uid, meta.player_index, meta.frame_id,
+                            "lap", lap,
+                        )
+                        if joined is not None:
+                            emit_joined_sample(meta, received_ns, joined)
                     elif meta.packet_id == 5:
+                        decoded_setup = decode_car_setup(packet, meta.player_index)
+                        setup = {
+                            **decoded_setup,
+                            "setup_frame_id": meta.frame_id,
+                            "setup_received_ns": received_ns,
+                            "_overall_frame_id": meta.overall_frame_id,
+                        }
+                        latest_setup[key] = setup
                         setup_writer.writerow({
                             "received_ns": received_ns,
                             "session_uid": meta.session_uid,
@@ -287,60 +331,38 @@ def main():
                             "frame_id": meta.frame_id,
                             "overall_frame_id": meta.overall_frame_id,
                             "vehicle_index": meta.player_index,
-                            **decode_car_setup(packet, meta.player_index),
+                            **decoded_setup,
                         })
                     elif meta.packet_id == 6:
-                        latest_telemetry[key] = {
+                        telemetry = {
                             **decode_telemetry(packet, meta.player_index),
                             "telemetry_received_ns": received_ns,
                             "telemetry_frame_id": meta.frame_id,
                         }
-                        lap = latest_lap.get(key)
-                        if lap is None:
-                            continue
-                        values = build_telemetry_row(
-                            received_ns,
-                            meta,
-                            lap,
-                            latest_status.get(key, {}),
-                            latest_damage.get(key, {}),
-                            latest_telemetry[key],
-                            latest_motion.get(key, {}),
-                            latest_session.get(meta.session_uid, {}),
+                        joined = frame_joiner.add(
+                            meta.session_uid, meta.player_index, meta.frame_id,
+                            "telemetry", telemetry,
                         )
-                        values, completed = tracker.process_sample(values)
-                        if values is None:
-                            continue
-                        telemetry_writer.writerow({
-                            field: values.get(field, "") for field in SAMPLE_FIELDS
-                        })
-                        braking_event, previous_brake, previous_brake_key = build_braking_event(
-                            values, previous_brake, previous_brake_key
-                        )
-                        if braking_event is not None:
-                            braking_writer.writerow(braking_event)
-                        sample_count += 1
-                        write_live_summaries(lap_file, trackers)
-                        write_live_segments(segments_file, trackers)
-                        if sample_count % 60 == 0:
-                            telemetry_file.flush()
-                            position_file.flush()
-                            lap_file.flush()
-                            segments_file.flush()
-                            braking_file.flush()
-                            flashback_file.flush()
-                            setup_file.flush()
+                        if joined is not None:
+                            emit_joined_sample(meta, received_ns, joined)
                     elif meta.packet_id == 7:
-                        latest_status[key] = {
+                        status = {
                             **decode_status(packet, meta.player_index),
                             "status_received_ns": received_ns,
                             "status_frame_id": meta.frame_id,
                         }
+                        joined = frame_joiner.add(
+                            meta.session_uid, meta.player_index, meta.frame_id,
+                            "status", status,
+                        )
+                        if joined is not None:
+                            emit_joined_sample(meta, received_ns, joined)
                     elif meta.packet_id == 10:
                         latest_damage[key] = {
                             **decode_damage(packet, meta.player_index),
                             "damage_received_ns": received_ns,
                             "damage_frame_id": meta.frame_id,
+                            "_overall_frame_id": meta.overall_frame_id,
                         }
             except KeyboardInterrupt:
                 print("\nRecording stopped.")

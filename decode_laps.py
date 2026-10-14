@@ -5,7 +5,10 @@ from pathlib import Path
 
 from lap_tracking import LapTracker
 from telemetry_common import (
+    CAR_SETUP_VALUE_FIELDS,
     HEADER,
+    FramePacketJoiner,
+    decode_car_setup,
     decode_damage,
     decode_flashback,
     decode_lap,
@@ -13,6 +16,7 @@ from telemetry_common import (
     decode_session,
     decode_status,
     decode_telemetry,
+    latest_with_frame_age,
     packet_meta,
     valid_2026_packet,
 )
@@ -23,6 +27,7 @@ MOTION_PACKET_ID = 0
 TELEMETRY_PACKET_ID = 6
 STATUS_PACKET_ID = 7
 DAMAGE_PACKET_ID = 10
+SETUP_PACKET_ID = 5
 WHEELS = ("rl", "rr", "fl", "fr")
 
 SAMPLE_FIELDS = [
@@ -37,13 +42,16 @@ SAMPLE_FIELDS = [
     "pitch_rad", "roll_rad", "lap_received_ns", "motion_frame_id",
     "motion_received_ns", "telemetry_frame_id", "telemetry_received_ns",
     "status_frame_id", "status_received_ns", "damage_frame_id", "damage_received_ns",
+    "damage_age_frames", "setup_frame_id", "setup_received_ns", "setup_age_frames",
     "tyre_compound_actual", "tyre_compound_visual", "tyre_age_laps",
     "weather_code", "weather_label", "track_temp_c", "air_temp_c",
     "total_laps", "track_length_m", "session_type_code", "track_id",
     "safety_car_status", "sector2_start_m", "sector3_start_m",
     "session_frame_id", "session_received_ns",
+    "session_age_frames",
     "lap_continuous", "segment_valid", "training_eligible", "exclusion_reason",
 ]
+SAMPLE_FIELDS.extend(CAR_SETUP_VALUE_FIELDS + ["next_front_wing_value"])
 for wheel in WHEELS:
     SAMPLE_FIELDS.extend([
         f"tyre_surface_temp_{wheel}_c", f"tyre_inner_temp_{wheel}_c",
@@ -111,13 +119,43 @@ def load_telemetry(csv_path):
 def read_recording(binary_path, telemetry=None, summaries=None, segments=None, flashback_events=None):
     telemetry = telemetry or {}
     rows = []
-    latest_lap = {}
-    latest_motion = {}
-    latest_status = {}
     latest_damage = {}
-    latest_telemetry = {}
+    latest_setup = {}
     latest_session = {}
+    frame_joiner = FramePacketJoiner()
     trackers = {}
+
+    def record_joined_sample(meta, received_ns, joined):
+        key = (meta.session_uid, meta.player_index)
+        car = telemetry.get((meta.session_uid, meta.frame_id), {})
+        sample = {
+            "received_ns": received_ns,
+            "udp_format": meta.packet_format,
+            "session_uid": meta.session_uid,
+            "session_time_s": round(meta.session_time_s, 6),
+            "frame_id": meta.frame_id,
+            "overall_frame_id": meta.overall_frame_id,
+            "vehicle_index": meta.player_index,
+            **joined["lap"],
+            **joined["motion"],
+            **joined["status"],
+            **car,
+            **joined["telemetry"],
+            **latest_with_frame_age(
+                latest_damage.get(key, {}), "damage", meta.overall_frame_id,
+            ),
+            **latest_with_frame_age(
+                latest_setup.get(key, {}), "setup", meta.overall_frame_id,
+            ),
+            **latest_with_frame_age(
+                latest_session.get(meta.session_uid, {}), "session",
+                meta.overall_frame_id,
+            ),
+        }
+        tracker = trackers.setdefault(key, LapTracker(*key))
+        sample, _ = tracker.process_sample(sample)
+        if sample is not None:
+            rows.append(sample)
 
     with binary_path.open("rb") as file:
         while True:
@@ -141,6 +179,7 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
                     **decode_session(packet),
                     "session_frame_id": meta.frame_id,
                     "session_received_ns": received_ns,
+                    "_overall_frame_id": meta.overall_frame_id,
                 }
                 continue
             if meta.player_index >= 24:
@@ -158,66 +197,56 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
                     )
                 continue
             if meta.packet_id == MOTION_PACKET_ID and valid_2026_packet(packet, MOTION_PACKET_ID):
-                latest_motion[key] = {
+                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "motion", {
                     **decode_motion(packet, meta.player_index),
                     "motion_received_ns": received_ns,
                     "motion_frame_id": meta.frame_id,
-                }
+                })
+                if joined is not None:
+                    record_joined_sample(meta, received_ns, joined)
+                continue
+            if meta.packet_id == LAP_PACKET_ID and valid_2026_packet(packet, LAP_PACKET_ID):
+                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "lap", {
+                    **decode_lap(packet, meta.player_index),
+                    "lap_received_ns": received_ns,
+                    "lap_frame_id": meta.frame_id,
+                })
+                if joined is not None:
+                    record_joined_sample(meta, received_ns, joined)
                 continue
             if meta.packet_id == STATUS_PACKET_ID and valid_2026_packet(packet, STATUS_PACKET_ID):
-                latest_status[key] = {
+                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "status", {
                     **decode_status(packet, meta.player_index),
                     "status_received_ns": received_ns,
                     "status_frame_id": meta.frame_id,
-                }
+                })
+                if joined is not None:
+                    record_joined_sample(meta, received_ns, joined)
                 continue
             if meta.packet_id == DAMAGE_PACKET_ID and valid_2026_packet(packet, DAMAGE_PACKET_ID):
                 latest_damage[key] = {
                     **decode_damage(packet, meta.player_index),
                     "damage_received_ns": received_ns,
                     "damage_frame_id": meta.frame_id,
+                    "_overall_frame_id": meta.overall_frame_id,
+                }
+                continue
+            if meta.packet_id == SETUP_PACKET_ID and valid_2026_packet(packet, SETUP_PACKET_ID):
+                latest_setup[key] = {
+                    **decode_car_setup(packet, meta.player_index),
+                    "setup_received_ns": received_ns,
+                    "setup_frame_id": meta.frame_id,
+                    "_overall_frame_id": meta.overall_frame_id,
                 }
                 continue
             if meta.packet_id == TELEMETRY_PACKET_ID and valid_2026_packet(packet, TELEMETRY_PACKET_ID):
-                latest_telemetry[key] = {
+                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "telemetry", {
                     **decode_telemetry(packet, meta.player_index),
                     "telemetry_received_ns": received_ns,
                     "telemetry_frame_id": meta.frame_id,
-                }
-                lap = latest_lap.get(key)
-                if lap is None:
-                    continue
-                car = telemetry.get((meta.session_uid, meta.frame_id), {})
-                sample = {
-                    "received_ns": received_ns,
-                    "udp_format": meta.packet_format,
-                    "session_uid": meta.session_uid,
-                    "session_time_s": round(meta.session_time_s, 6),
-                    "frame_id": meta.frame_id,
-                    "overall_frame_id": meta.overall_frame_id,
-                    "vehicle_index": meta.player_index,
-                    **lap,
-                    **car,
-                    **latest_motion.get(key, {}),
-                    **latest_status.get(key, {}),
-                    **latest_damage.get(key, {}),
-                    **latest_telemetry.get(key, {}),
-                    **latest_session.get(meta.session_uid, {}),
-                }
-                tracker = trackers.setdefault(key, LapTracker(*key))
-                sample, _ = tracker.process_sample(sample)
-                if sample is not None:
-                    rows.append(sample)
-                continue
-            if meta.packet_id != LAP_PACKET_ID or not valid_2026_packet(packet, LAP_PACKET_ID):
-                continue
-
-            lap = decode_lap(packet, meta.player_index)
-            latest_lap[key] = {
-                **lap,
-                "lap_received_ns": received_ns,
-                "lap_frame_id": meta.frame_id,
-            }
+                })
+                if joined is not None:
+                    record_joined_sample(meta, received_ns, joined)
 
     for tracker in trackers.values():
         tracker.finish()
@@ -302,6 +331,7 @@ def filter_training_rows(rows, segments, summaries):
         and _is_true(summary.get("complete"))
         and _is_true(summary.get("continuous"))
         and _is_true(summary.get("training_eligible"))
+        and str(summary.get("condition_class", "")).strip().lower() in {"dry", "wet"}
     }
     eligible_segments = {
         tuple(_key_value(segment.get(field)) for field in (

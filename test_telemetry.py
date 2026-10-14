@@ -62,6 +62,8 @@ def make_sample(
         "received_ns": received_ns,
         "lap_invalid": invalid,
         "pit_status": pit,
+        "weather_code": 0,
+        "tyre_compound_actual": 18,
         "speed_kmh": speed,
         "brake_pct": brake,
         "throttle_pct": throttle,
@@ -89,13 +91,55 @@ def lap_packet(*, lap=1, current_ms=500, last_ms=0, distance=100.0, frame=1,
     return bytes(packet)
 
 
-def telemetry_packet(*, speed=250, session=1, frame=1, player=0):
-    packet = make_packet(6, session=session, frame=frame, player=player)
+def telemetry_packet(*, speed=250, session=1, frame=1, player=0, session_time=1.0):
+    packet = make_packet(
+        6, session=session, frame=frame, player=player, session_time=session_time,
+    )
     offset = HEADER.size + player * struct.calcsize("<HfffBbHBBH4H4B4BB4f4B")
     struct.pack_into("<HfffBbH", packet, offset, speed, 0.75, -0.25, 0.5, 20, 7, 10000)
     packet[offset + 30] = 70
     packet[offset + 31] = 71
     return bytes(packet)
+
+
+def motion_packet(*, session=1, frame=1, player=0, session_time=1.0, world_x=0.0):
+    packet = make_packet(
+        0, session=session, frame=frame, player=player, session_time=session_time,
+    )
+    struct.pack_into("<f", packet, HEADER.size + player * 60, world_x)
+    return bytes(packet)
+
+
+def status_packet(*, session=1, frame=1, player=0, session_time=1.0, compound=18):
+    packet = make_packet(
+        7, session=session, frame=frame, player=player, session_time=session_time,
+    )
+    packet[HEADER.size + player * 59 + 25] = compound
+    packet[HEADER.size + player * 59 + 26] = compound
+    return bytes(packet)
+
+
+def frame_packets(
+    *, session=1, frame=1, player=0, session_time=1.0, lap=1,
+    current_ms=500, last_ms=0, distance=100.0, speed=250, compound=18,
+):
+    return [
+        lap_packet(
+            session=session, frame=frame, player=player, session_time=session_time,
+            lap=lap, current_ms=current_ms, last_ms=last_ms, distance=distance,
+        ),
+        motion_packet(
+            session=session, frame=frame, player=player, session_time=session_time,
+        ),
+        status_packet(
+            session=session, frame=frame, player=player, session_time=session_time,
+            compound=compound,
+        ),
+        telemetry_packet(
+            speed=speed, session=session, frame=frame, player=player,
+            session_time=session_time,
+        ),
+    ]
 
 
 def flashback_packet(*, target_frame=1, target_time=1.0, session=1, frame=100):
@@ -237,7 +281,10 @@ class LapAndSegmentTests(unittest.TestCase):
         for code in (99, "", None):
             self.assertEqual(classify_compound(code), "unknown")
         self.assertEqual(lap_condition_class({"dry"}, {"dry"}), "dry")
+        self.assertEqual(lap_condition_class({"wet"}, {"wet"}), "wet")
         self.assertEqual(lap_condition_class({"unknown"}, {"dry"}), "unknown")
+        self.assertEqual(lap_condition_class({"wet"}, {"dry"}), "unknown")
+        self.assertEqual(lap_condition_class({"dry"}, {"intermediate"}), "unknown")
 
     def test_lap_summary_classifies_stable_dry_conditions(self):
         tracker = LapTracker(1, 0)
@@ -252,7 +299,7 @@ class LapAndSegmentTests(unittest.TestCase):
         self.assertEqual(completed["condition_class"], "dry")
         self.assertFalse(completed["weather_changed_in_lap"])
 
-    def test_lap_summary_detects_weather_change_to_wet(self):
+    def test_lap_summary_rejects_wet_weather_on_dry_compound(self):
         tracker = LapTracker(1, 0)
         tracker.process_sample(make_sample(
             lap=1, current=0.5, frame=1, weather_code=0,
@@ -268,27 +315,53 @@ class LapAndSegmentTests(unittest.TestCase):
         ))
         self.assertTrue(completed["weather_changed_in_lap"])
         self.assertEqual(completed["weather_codes_seen"], "0|3")
-        self.assertEqual(completed["condition_class"], "wet")
+        self.assertEqual(completed["condition_class"], "unknown")
+        self.assertTrue(completed["valid"])
+        self.assertFalse(completed["training_eligible"])
+
+    def test_lap_training_ignores_weather_changes_within_dry_class(self):
+        tracker = LapTracker(1, 0)
+        tracker.process_sample(make_sample(
+            lap=1, current=0.5, frame=1, weather_code=0,
+            tyre_compound_actual=18,
+        ))
+        tracker.process_sample(make_sample(
+            lap=1, current=20.0, frame=2, session_time=10.016,
+            weather_code=2, tyre_compound_actual=18,
+        ))
+        _, completed = tracker.process_sample(make_sample(
+            lap=2, current=0.2, last=92.0, frame=3,
+            session_time=10.032, weather_code=2, tyre_compound_actual=18,
+        ))
+        self.assertEqual(completed["weather_codes_seen"], "0|2")
+        self.assertFalse(completed["weather_changed_in_lap"])
+        self.assertEqual(completed["condition_class"], "dry")
+        self.assertTrue(completed["training_eligible"])
 
     def test_lap_summary_classifies_intermediate_compound_as_wet(self):
         tracker = LapTracker(1, 0)
         tracker.process_sample(make_sample(
-            lap=1, current=0.5, frame=1, weather_code=0,
+            lap=1, current=0.5, frame=1, weather_code=3,
             tyre_compound_actual=7,
         ))
         _, completed = tracker.process_sample(make_sample(
             lap=2, current=0.2, last=92.0, frame=2,
-            session_time=10.016, weather_code=0, tyre_compound_actual=7,
+            session_time=10.016, weather_code=3, tyre_compound_actual=7,
         ))
         self.assertEqual(completed["condition_class"], "wet")
+        self.assertTrue(completed["training_eligible"])
 
     def test_lap_without_weather_is_unknown_and_summary_fields_are_defined(self):
         tracker = LapTracker(1, 0)
-        tracker.process_sample(make_sample(lap=1, current=0.5, frame=1))
+        tracker.process_sample(make_sample(
+            lap=1, current=0.5, frame=1, weather_code=None,
+        ))
         _, completed = tracker.process_sample(make_sample(
             lap=2, current=0.2, last=92.0, frame=2, session_time=10.016,
+            weather_code=None,
         ))
         self.assertEqual(completed["condition_class"], "unknown")
+        self.assertFalse(completed["training_eligible"])
         for field in (
             "weather_codes_seen", "weather_changed_in_lap",
             "compound_codes_seen", "condition_class",
@@ -396,8 +469,14 @@ class LapAndSegmentTests(unittest.TestCase):
             "session_uid": "1", "vehicle_index": "0", "lap_number": "1",
             "valid": "True", "complete": "True", "continuous": "True",
             "training_eligible": "True",
+            "condition_class": "dry",
         }]
         self.assertEqual(filter_training_rows(rows, segments, summaries), [rows[0]])
+        summary_without_conditions = dict(summaries[0])
+        summary_without_conditions.pop("condition_class")
+        self.assertEqual(
+            filter_training_rows(rows, segments, [summary_without_conditions]), [],
+        )
 
     def test_incomplete_lap_segment_is_not_training_eligible(self):
         rows = [{
@@ -607,12 +686,14 @@ class PacketAndOutputTests(unittest.TestCase):
 
     def test_pipeline_caches_are_isolated_by_session_and_vehicle(self):
         pipeline = PipelineState()
-        pipeline.process(telemetry_packet(speed=111, session=1, frame=1, player=0))
-        pipeline.process(telemetry_packet(speed=222, session=1, frame=1, player=1))
-        pipeline.process(telemetry_packet(speed=333, session=2, frame=1, player=0))
-        self.assertEqual(pipeline.latest_telemetry[(1, 0)]["speed_kmh"], 111)
-        self.assertEqual(pipeline.latest_telemetry[(1, 1)]["speed_kmh"], 222)
-        self.assertEqual(pipeline.latest_telemetry[(2, 0)]["speed_kmh"], 333)
+        for session, player, speed in ((1, 0, 111), (1, 1, 222), (2, 0, 333)):
+            for packet in frame_packets(
+                session=session, frame=1, player=player, speed=speed,
+            ):
+                pipeline.process(packet)
+        self.assertEqual(pipeline.snapshot(1, 0)["speed_kmh"], 111)
+        self.assertEqual(pipeline.snapshot(1, 1)["speed_kmh"], 222)
+        self.assertEqual(pipeline.snapshot(2, 0)["speed_kmh"], 333)
 
     def test_car_setup_packet_decodes_setup_and_next_front_wing(self):
         packet = make_packet(5)
@@ -633,14 +714,30 @@ class PacketAndOutputTests(unittest.TestCase):
 
     def test_pipeline_synchronizes_lap_and_latest_telemetry(self):
         pipeline = PipelineState()
-        pipeline.process(lap_packet(frame=1))
-        result = pipeline.process(telemetry_packet(speed=225, frame=1))
+        result = None
+        for packet in frame_packets(frame=1, speed=225):
+            result = pipeline.process(packet)
         if result is None:
-            self.fail("Telemetry packet should produce a sample when lap data is available")
+            self.fail("Matching frame packets should produce a joined telemetry sample")
         self.assertEqual(result["kind"], "telemetry")
         self.assertEqual(result["speed_kmh"], 225)
+        self.assertEqual(result["lap_frame_id"], result["frame_id"])
+        self.assertEqual(result["motion_frame_id"], result["frame_id"])
+        self.assertEqual(result["status_frame_id"], result["frame_id"])
+        self.assertEqual(result["telemetry_frame_id"], result["frame_id"])
         self.assertEqual(result["segment_id"], 1)
         self.assertEqual(result["segment_sample_index"], 0)
+
+    def test_pipeline_does_not_join_stale_frame_components(self):
+        pipeline = PipelineState()
+        for packet in (
+            lap_packet(frame=1),
+            motion_packet(frame=1),
+            status_packet(frame=1),
+            telemetry_packet(frame=2),
+        ):
+            pipeline.process(packet)
+        self.assertEqual(pipeline.latest_samples, {})
 
     def test_pipeline_attaches_latest_shared_session_data(self):
         session_packet = make_packet(1, session=7, frame=3)
@@ -649,27 +746,50 @@ class PacketAndOutputTests(unittest.TestCase):
         struct.pack_into("<ff", session_packet, 745, 1500.5, 3200.25)
         pipeline = PipelineState()
         pipeline.process(bytes(session_packet), received_ns=300)
-        pipeline.process(lap_packet(session=7, frame=4))
-
-        result = pipeline.process(
-            telemetry_packet(session=7, speed=225, frame=5), received_ns=500
-        )
+        result = None
+        for packet in frame_packets(
+            session=7, frame=5, speed=225, session_time=5.0,
+        ):
+            result = pipeline.process(packet, received_ns=500)
 
         self.assertIsNotNone(result)
         self.assertEqual(result["kind"], "telemetry")
         self.assertEqual(result["weather_code"], 4)
         self.assertEqual(result["track_id"], 7)
         self.assertEqual(result["session_frame_id"], 3)
+        self.assertEqual(result["session_age_frames"], 2)
 
     def test_pipeline_leaves_session_fields_absent_without_session_packet(self):
         pipeline = PipelineState()
-        pipeline.process(lap_packet(frame=1))
-
-        result = pipeline.process(telemetry_packet(speed=225, frame=2))
+        result = None
+        for packet in frame_packets(frame=2, speed=225, session_time=2.0):
+            result = pipeline.process(packet)
 
         self.assertIsNotNone(result)
         self.assertIn(result.get("weather_code"), (None, ""))
         self.assertIn(result.get("weather_label", ""), (None, ""))
+
+    def test_pipeline_attaches_aged_damage_setup_and_session_only(self):
+        session_packet = make_packet(1, session=1, frame=3)
+        setup_packet = make_packet(5, session=1, frame=4)
+        damage_packet = make_packet(10, session=1, frame=4)
+        pipeline = PipelineState()
+        pipeline.process(bytes(session_packet))
+        pipeline.process(bytes(setup_packet))
+        pipeline.process(bytes(damage_packet))
+
+        result = None
+        for packet in frame_packets(frame=5, session_time=5.0):
+            result = pipeline.process(packet)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_age_frames"], 2)
+        self.assertEqual(result["setup_age_frames"], 1)
+        self.assertEqual(result["damage_age_frames"], 1)
+        self.assertNotIn("motion_age_frames", result)
+        self.assertNotIn("status_age_frames", result)
+        self.assertNotIn("lap_age_frames", result)
+        self.assertNotIn("telemetry_age_frames", result)
 
     def test_sample_fields_include_shared_session_columns(self):
         session_fields = (
@@ -677,14 +797,16 @@ class PacketAndOutputTests(unittest.TestCase):
             "total_laps", "track_length_m", "session_type_code", "track_id",
             "safety_car_status", "sector2_start_m", "sector3_start_m",
             "session_frame_id", "session_received_ns",
+            "session_age_frames", "damage_age_frames",
+            "setup_frame_id", "setup_received_ns", "setup_age_frames",
         )
         for field in session_fields:
             self.assertIn(field, SAMPLE_FIELDS)
 
     def test_pipeline_records_flashback_as_diagnostic_event(self):
         pipeline = PipelineState()
-        pipeline.process(lap_packet(frame=1))
-        pipeline.process(telemetry_packet(frame=1))
+        for packet in frame_packets(frame=1):
+            pipeline.process(packet)
         result = pipeline.process(flashback_packet(target_frame=1, target_time=1))
         if result is None:
             self.fail("Flashback packet should produce a diagnostic event")
@@ -732,34 +854,33 @@ class PacketAndOutputTests(unittest.TestCase):
         self.assertEqual(key, (1, 0, 1, 2))
 
     def test_offline_decoder_reads_raw_binary_without_sidecar_csv(self):
-        packets = [
-            (1_000_000_000, lap_packet(lap=1, frame=1, session_time=10.0)),
-            (1_016_000_000, telemetry_packet(speed=201, frame=2)),
-            (1_032_000_000, lap_packet(lap=1, current_ms=1000, frame=3, session_time=10.032)),
-        ]
+        packets = frame_packets(
+            lap=1, frame=1, session_time=10.0, speed=201,
+        )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.bin"
             with path.open("wb") as file:
-                for received_ns, packet in packets:
-                    file.write(struct.pack("<QI", received_ns, len(packet)))
+                for index, packet in enumerate(packets, start=1):
+                    file.write(struct.pack("<QI", index * 1_000_000, len(packet)))
                     file.write(packet)
             samples = read_recording(path)
         self.assertEqual(len(samples), 1)
         self.assertIn("segment_id", samples[0])
         self.assertEqual(samples[0]["speed_kmh"], 201)
 
-    def test_raw_decoder_uses_lap_cache_when_emitting_telemetry_samples(self):
+    def test_raw_decoder_requires_exact_frame_matches(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.bin"
-            packets = [lap_packet(frame=1), telemetry_packet(speed=175, frame=2)]
+            packets = [
+                lap_packet(frame=1), motion_packet(frame=1), status_packet(frame=1),
+                telemetry_packet(speed=175, frame=2),
+            ]
             path.write_bytes(b"".join(
                 struct.pack("<QI", index, len(packet)) + packet
                 for index, packet in enumerate(packets, start=1)
             ))
             rows = read_recording(path)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["lap_number"], 1)
-        self.assertEqual(rows[0]["speed_kmh"], 175)
+        self.assertEqual(rows, [])
 
     def test_raw_decoder_attaches_session_packet_to_telemetry_row(self):
         session_packet = make_packet(1, session=3, frame=1)
@@ -768,8 +889,7 @@ class PacketAndOutputTests(unittest.TestCase):
         struct.pack_into("<ff", session_packet, 745, 1500.5, 3200.25)
         packets = [
             bytes(session_packet),
-            lap_packet(session=3, frame=2),
-            telemetry_packet(session=3, speed=201, frame=3),
+            *frame_packets(session=3, frame=3, session_time=3.0, speed=201),
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.bin"
@@ -782,16 +902,19 @@ class PacketAndOutputTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["weather_code"], 3)
+        self.assertEqual(rows[0]["session_age_frames"], 2)
 
     def test_offline_decoder_writes_only_complete_laps_to_training_csv(self):
-        packets = [
-            lap_packet(lap=1, current_ms=500, frame=1),
-            telemetry_packet(speed=200, frame=2),
-            lap_packet(lap=1, current_ms=1000, distance=100, frame=3),
-            telemetry_packet(speed=201, frame=4),
-            lap_packet(lap=2, current_ms=200, last_ms=92000, frame=5),
-            telemetry_packet(speed=202, frame=6),
-        ]
+        packets = [bytes(make_packet(1, frame=0))]
+        for frame, session_time, lap, current, last, speed in (
+            (1, 10.0, 1, 500, 0, 200),
+            (3, 10.032, 1, 1000, 0, 201),
+            (5, 10.064, 2, 200, 92000, 202),
+        ):
+            packets.extend(frame_packets(
+                lap=lap, current_ms=current, last_ms=last, distance=100,
+                frame=frame, session_time=session_time, speed=speed,
+            ))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.bin"
             path.write_bytes(b"".join(
