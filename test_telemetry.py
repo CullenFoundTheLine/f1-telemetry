@@ -24,6 +24,9 @@ from receiver import (
 from telemetry_common import (
     CAR_SETUP,
     HEADER,
+    MAX_DAMAGE_AGE_FRAMES,
+    MAX_SESSION_AGE_FRAMES,
+    MAX_SETUP_AGE_FRAMES,
     PACKET_SIZES_2026,
     decode_car_setup,
     decode_damage,
@@ -456,8 +459,10 @@ class LapAndSegmentTests(unittest.TestCase):
 
     def test_final_training_filter_accepts_csv_boolean_values(self):
         rows = [
-            {"session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 1},
-            {"session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 2},
+            {"session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 1,
+             "sample_complete": "True", "damage_stale": "False", "session_stale": "False"},
+            {"session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 2,
+             "sample_complete": "True", "damage_stale": "False", "session_stale": "False"},
         ]
         segments = [
             {"session_uid": "1", "vehicle_index": "0", "lap_number": "1", "segment_id": "1",
@@ -477,6 +482,29 @@ class LapAndSegmentTests(unittest.TestCase):
         self.assertEqual(
             filter_training_rows(rows, segments, [summary_without_conditions]), [],
         )
+
+    def test_training_filter_rejects_incomplete_or_stale_rows(self):
+        row = {
+            "session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 1,
+            "sample_complete": True, "damage_stale": False, "session_stale": False,
+        }
+        segment = {
+            "session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 1,
+            "segment_valid": True, "training_eligible": True,
+        }
+        summary = {
+            "session_uid": 1, "vehicle_index": 0, "lap_number": 1,
+            "valid": True, "complete": True, "continuous": True,
+            "training_eligible": True, "condition_class": "dry",
+        }
+        for change in (
+            {"sample_complete": False},
+            {"damage_stale": True},
+            {"session_stale": True},
+        ):
+            self.assertEqual(
+                filter_training_rows([{**row, **change}], [segment], [summary]), [],
+            )
 
     def test_incomplete_lap_segment_is_not_training_eligible(self):
         rows = [{
@@ -739,6 +767,58 @@ class PacketAndOutputTests(unittest.TestCase):
             pipeline.process(packet)
         self.assertEqual(pipeline.latest_samples, {})
 
+    def test_pipeline_flushes_partial_frames_with_missing_stream_names(self):
+        packets_by_missing_stream = {
+            "lap": [motion_packet(), status_packet(), telemetry_packet()],
+            "motion": [lap_packet(), status_packet(), telemetry_packet()],
+            "status": [lap_packet(), motion_packet(), telemetry_packet()],
+            "telemetry": [lap_packet(), motion_packet(), status_packet()],
+        }
+        for missing_stream, packets in packets_by_missing_stream.items():
+            pipeline = PipelineState()
+            for packet in packets:
+                pipeline.process(packet)
+            flushed = pipeline.finish()
+            self.assertEqual(len(flushed), 1)
+            row = flushed[0]
+            self.assertFalse(row["sample_complete"])
+            self.assertEqual(row["missing_streams"], missing_stream)
+            self.assertFalse(row["training_eligible"])
+
+    def test_pipeline_marks_slow_streams_stale_only_beyond_limits(self):
+        self.assertEqual(MAX_DAMAGE_AGE_FRAMES, 6)
+        self.assertEqual(MAX_SETUP_AGE_FRAMES, 29)
+        self.assertEqual(MAX_SESSION_AGE_FRAMES, 29)
+
+        pipeline = PipelineState()
+        for packet in (
+            make_packet(1, frame=1),
+            make_packet(5, frame=1),
+            make_packet(10, frame=1),
+        ):
+            pipeline.process(bytes(packet))
+
+        row_at_limit = None
+        for packet in frame_packets(frame=30, session_time=30.0):
+            row_at_limit = pipeline.process(packet)
+        self.assertFalse(row_at_limit["setup_stale"])
+        self.assertFalse(row_at_limit["session_stale"])
+        self.assertTrue(row_at_limit["damage_stale"])
+
+        row_past_limit = None
+        for packet in frame_packets(frame=31, session_time=31.0):
+            row_past_limit = pipeline.process(packet)
+        self.assertTrue(row_past_limit["setup_stale"])
+        self.assertTrue(row_past_limit["session_stale"])
+
+        damage_boundary_pipeline = PipelineState()
+        damage_boundary_pipeline.process(bytes(make_packet(10, frame=1)))
+        row = None
+        for packet in frame_packets(frame=7, session_time=7.0):
+            row = damage_boundary_pipeline.process(packet)
+        self.assertEqual(row["damage_age_frames"], MAX_DAMAGE_AGE_FRAMES)
+        self.assertFalse(row["damage_stale"])
+
     def test_pipeline_attaches_latest_shared_session_data(self):
         session_packet = make_packet(1, session=7, frame=3)
         struct.pack_into("<BbbBHBb", session_packet, 29, 4, 32, 21, 58, 5300, 10, 7)
@@ -801,6 +881,11 @@ class PacketAndOutputTests(unittest.TestCase):
             "setup_frame_id", "setup_received_ns", "setup_age_frames",
         )
         for field in session_fields:
+            self.assertIn(field, SAMPLE_FIELDS)
+        for field in (
+            "sample_complete", "missing_streams", "damage_stale",
+            "setup_stale", "session_stale",
+        ):
             self.assertIn(field, SAMPLE_FIELDS)
 
     def test_pipeline_records_flashback_as_diagnostic_event(self):
@@ -880,7 +965,33 @@ class PacketAndOutputTests(unittest.TestCase):
                 for index, packet in enumerate(packets, start=1)
             ))
             rows = read_recording(path)
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row["missing_streams"] for row in rows},
+            {"telemetry", "lap|motion|status"},
+        )
+        self.assertTrue(all(not row["sample_complete"] for row in rows))
+        self.assertTrue(all(not row["training_eligible"] for row in rows))
+
+    def test_raw_decoder_keeps_incomplete_frames_as_diagnostics(self):
+        packets_by_missing_stream = {
+            "lap": [motion_packet(), status_packet(), telemetry_packet()],
+            "motion": [lap_packet(), status_packet(), telemetry_packet()],
+            "status": [lap_packet(), motion_packet(), telemetry_packet()],
+            "telemetry": [lap_packet(), motion_packet(), status_packet()],
+        }
+        for missing_stream, packets in packets_by_missing_stream.items():
+            with self.subTest(missing_stream=missing_stream), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "raw.bin"
+                path.write_bytes(b"".join(
+                    struct.pack("<QI", index, len(packet)) + packet
+                    for index, packet in enumerate(packets, start=1)
+                ))
+                rows = read_recording(path)
+                self.assertEqual(len(rows), 1)
+                self.assertFalse(rows[0]["sample_complete"])
+                self.assertEqual(rows[0]["missing_streams"], missing_stream)
+                self.assertFalse(rows[0]["training_eligible"])
 
     def test_raw_decoder_attaches_session_packet_to_telemetry_row(self):
         session_packet = make_packet(1, session=3, frame=1)
@@ -905,7 +1016,10 @@ class PacketAndOutputTests(unittest.TestCase):
         self.assertEqual(rows[0]["session_age_frames"], 2)
 
     def test_offline_decoder_writes_only_complete_laps_to_training_csv(self):
-        packets = [bytes(make_packet(1, frame=0))]
+        packets = [
+            bytes(make_packet(1, frame=0)),
+            bytes(make_packet(10, frame=0)),
+        ]
         for frame, session_time, lap, current, last, speed in (
             (1, 10.0, 1, 500, 0, 200),
             (3, 10.032, 1, 1000, 0, 201),

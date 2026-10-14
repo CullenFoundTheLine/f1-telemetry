@@ -16,7 +16,9 @@ from telemetry_common import (
     decode_session,
     decode_status,
     decode_telemetry,
+    frame_join_metadata,
     latest_with_frame_age,
+    mark_sample_completeness,
     packet_meta,
     valid_2026_packet,
 )
@@ -49,6 +51,8 @@ SAMPLE_FIELDS = [
     "safety_car_status", "sector2_start_m", "sector3_start_m",
     "session_frame_id", "session_received_ns",
     "session_age_frames",
+    "sample_complete", "missing_streams", "damage_stale", "setup_stale",
+    "session_stale",
     "lap_continuous", "segment_valid", "training_eligible", "exclusion_reason",
 ]
 SAMPLE_FIELDS.extend(CAR_SETUP_VALUE_FIELDS + ["next_front_wing_value"])
@@ -125,37 +129,58 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
     frame_joiner = FramePacketJoiner()
     trackers = {}
 
-    def record_joined_sample(meta, received_ns, joined):
-        key = (meta.session_uid, meta.player_index)
-        car = telemetry.get((meta.session_uid, meta.frame_id), {})
+    def record_joined_sample(joined):
+        metadata = joined["_metadata"]
+        key = (metadata["session_uid"], metadata["vehicle_index"])
+        car = telemetry.get((metadata["session_uid"], metadata["frame_id"]), {})
         sample = {
-            "received_ns": received_ns,
-            "udp_format": meta.packet_format,
-            "session_uid": meta.session_uid,
-            "session_time_s": round(meta.session_time_s, 6),
-            "frame_id": meta.frame_id,
-            "overall_frame_id": meta.overall_frame_id,
-            "vehicle_index": meta.player_index,
-            **joined["lap"],
-            **joined["motion"],
-            **joined["status"],
+            "received_ns": metadata["received_ns"],
+            "udp_format": metadata["packet_format"],
+            "session_uid": metadata["session_uid"],
+            "session_time_s": round(metadata["session_time_s"], 6),
+            "frame_id": metadata["frame_id"],
+            "overall_frame_id": metadata["overall_frame_id"],
+            "vehicle_index": metadata["vehicle_index"],
+            **joined.get("lap", {}),
+            **joined.get("motion", {}),
+            **joined.get("status", {}),
             **car,
-            **joined["telemetry"],
+            **joined.get("telemetry", {}),
             **latest_with_frame_age(
-                latest_damage.get(key, {}), "damage", meta.overall_frame_id,
+                metadata["damage"], "damage", metadata["overall_frame_id"],
             ),
             **latest_with_frame_age(
-                latest_setup.get(key, {}), "setup", meta.overall_frame_id,
+                metadata["setup"], "setup", metadata["overall_frame_id"],
             ),
             **latest_with_frame_age(
-                latest_session.get(meta.session_uid, {}), "session",
-                meta.overall_frame_id,
+                metadata["session"], "session", metadata["overall_frame_id"],
             ),
         }
+        mark_sample_completeness(sample, joined)
+        if not sample["sample_complete"]:
+            rows.append(sample)
+            return
         tracker = trackers.setdefault(key, LapTracker(*key))
         sample, _ = tracker.process_sample(sample)
         if sample is not None:
             rows.append(sample)
+
+    def add_frame_packet(meta, received_ns, stream, values):
+        key = (meta.session_uid, meta.player_index)
+        metadata = frame_join_metadata(
+            meta,
+            received_ns,
+            latest_damage.get(key),
+            latest_setup.get(key),
+            latest_session.get(meta.session_uid),
+        )
+        joined = frame_joiner.add(
+            key[0], key[1], meta.frame_id, stream, values, metadata,
+        )
+        if joined is not None:
+            record_joined_sample(joined)
+        for _, _, expired in frame_joiner.drain_expired():
+            record_joined_sample(expired)
 
     with binary_path.open("rb") as file:
         while True:
@@ -197,31 +222,25 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
                     )
                 continue
             if meta.packet_id == MOTION_PACKET_ID and valid_2026_packet(packet, MOTION_PACKET_ID):
-                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "motion", {
+                add_frame_packet(meta, received_ns, "motion", {
                     **decode_motion(packet, meta.player_index),
                     "motion_received_ns": received_ns,
                     "motion_frame_id": meta.frame_id,
                 })
-                if joined is not None:
-                    record_joined_sample(meta, received_ns, joined)
                 continue
             if meta.packet_id == LAP_PACKET_ID and valid_2026_packet(packet, LAP_PACKET_ID):
-                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "lap", {
+                add_frame_packet(meta, received_ns, "lap", {
                     **decode_lap(packet, meta.player_index),
                     "lap_received_ns": received_ns,
                     "lap_frame_id": meta.frame_id,
                 })
-                if joined is not None:
-                    record_joined_sample(meta, received_ns, joined)
                 continue
             if meta.packet_id == STATUS_PACKET_ID and valid_2026_packet(packet, STATUS_PACKET_ID):
-                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "status", {
+                add_frame_packet(meta, received_ns, "status", {
                     **decode_status(packet, meta.player_index),
                     "status_received_ns": received_ns,
                     "status_frame_id": meta.frame_id,
                 })
-                if joined is not None:
-                    record_joined_sample(meta, received_ns, joined)
                 continue
             if meta.packet_id == DAMAGE_PACKET_ID and valid_2026_packet(packet, DAMAGE_PACKET_ID):
                 latest_damage[key] = {
@@ -240,14 +259,14 @@ def read_recording(binary_path, telemetry=None, summaries=None, segments=None, f
                 }
                 continue
             if meta.packet_id == TELEMETRY_PACKET_ID and valid_2026_packet(packet, TELEMETRY_PACKET_ID):
-                joined = frame_joiner.add(key[0], key[1], meta.frame_id, "telemetry", {
+                add_frame_packet(meta, received_ns, "telemetry", {
                     **decode_telemetry(packet, meta.player_index),
                     "telemetry_received_ns": received_ns,
                     "telemetry_frame_id": meta.frame_id,
                 })
-                if joined is not None:
-                    record_joined_sample(meta, received_ns, joined)
 
+    for _, _, pending in frame_joiner.flush():
+        record_joined_sample(pending)
     for tracker in trackers.values():
         tracker.finish()
         if summaries is not None:
@@ -314,6 +333,10 @@ def _is_true(value):
     return value is True or str(value).strip().lower() in {"1", "true"}
 
 
+def _is_false(value):
+    return value is False or str(value).strip().lower() in {"0", "false"}
+
+
 def _key_value(value):
     try:
         return int(value)
@@ -352,6 +375,9 @@ def filter_training_rows(rows, segments, summaries):
         and tuple(_key_value(row.get(field)) for field in (
             "session_uid", "vehicle_index", "lap_number", "segment_id",
         )) in eligible_segments
+        and _is_true(row.get("sample_complete"))
+        and _is_false(row.get("damage_stale"))
+        and _is_false(row.get("session_stale"))
     ]
 
 

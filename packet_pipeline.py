@@ -12,7 +12,9 @@ from telemetry_common import (
     decode_session,
     decode_status,
     decode_telemetry,
+    frame_join_metadata,
     latest_with_frame_age,
+    mark_sample_completeness,
     packet_meta,
     valid_packet,
 )
@@ -27,45 +29,39 @@ class PipelineState:
     latest_session: dict = field(default_factory=dict)
     frame_joiner: FramePacketJoiner = field(default_factory=FramePacketJoiner)
 
-    def _add_frame_part(self, meta, received_ns, stream, decoded):
-        values = {
-            **decoded,
-            f"{stream}_frame_id": meta.frame_id,
-            f"{stream}_received_ns": received_ns,
+    def _process_joined(self, joined):
+        metadata = joined["_metadata"]
+        key = (metadata["session_uid"], metadata["vehicle_index"])
+        sample = {
+            "received_ns": metadata["received_ns"],
+            "udp_format": metadata["packet_format"],
+            "session_uid": metadata["session_uid"],
+            "vehicle_index": metadata["vehicle_index"],
+            "frame_id": metadata["frame_id"],
+            "overall_frame_id": metadata["overall_frame_id"],
+            "session_time_s": metadata["session_time_s"],
+            **joined.get("lap", {}),
+            **joined.get("motion", {}),
+            **joined.get("status", {}),
+            **joined.get("telemetry", {}),
+            **latest_with_frame_age(
+                metadata["damage"], "damage", metadata["overall_frame_id"],
+            ),
+            **latest_with_frame_age(
+                metadata["setup"], "setup", metadata["overall_frame_id"],
+            ),
+            **latest_with_frame_age(
+                metadata["session"], "session", metadata["overall_frame_id"],
+            ),
         }
-        joined = self.frame_joiner.add(
-            meta.session_uid, meta.player_index, meta.frame_id, stream, values,
-        )
-        if joined is None:
-            return None
+        mark_sample_completeness(sample, joined)
+        if not sample["sample_complete"]:
+            return {"kind": "telemetry", **sample}
 
-        key = (meta.session_uid, meta.player_index)
         tracker = self.lap_states.setdefault(
-            key, LapTracker(meta.session_uid, meta.player_index)
+            key, LapTracker(metadata["session_uid"], metadata["vehicle_index"])
         )
-        source_sample = {
-            **joined["lap"],
-            **joined["motion"],
-            **joined["status"],
-            **latest_with_frame_age(
-                self.latest_damage.get(key, {}), "damage", meta.overall_frame_id,
-            ),
-            **latest_with_frame_age(
-                self.latest_setup.get(key, {}), "setup", meta.overall_frame_id,
-            ),
-            **latest_with_frame_age(
-                self.latest_session.get(meta.session_uid, {}), "session",
-                meta.overall_frame_id,
-            ),
-            **joined["telemetry"],
-            "session_uid": meta.session_uid,
-            "vehicle_index": meta.player_index,
-            "frame_id": meta.frame_id,
-            "overall_frame_id": meta.overall_frame_id,
-            "session_time_s": meta.session_time_s,
-            "received_ns": received_ns,
-        }
-        sample, completed = tracker.process_sample(source_sample)
+        sample, completed = tracker.process_sample(sample)
         if sample is None:
             return {
                 "kind": "telemetry", "completed": completed,
@@ -73,6 +69,37 @@ class PipelineState:
             }
         self.latest_samples[key] = sample
         return {"kind": "telemetry", "completed": completed, **sample}
+
+    def _add_frame_part(self, meta, received_ns, stream, decoded):
+        values = {
+            **decoded,
+            f"{stream}_frame_id": meta.frame_id,
+            f"{stream}_received_ns": received_ns,
+        }
+        key = (meta.session_uid, meta.player_index)
+        metadata = frame_join_metadata(
+            meta,
+            received_ns,
+            self.latest_damage.get(key),
+            self.latest_setup.get(key),
+            self.latest_session.get(meta.session_uid),
+        )
+        joined = self.frame_joiner.add(
+            meta.session_uid, meta.player_index, meta.frame_id, stream, values,
+            metadata,
+        )
+        output = self._process_joined(joined) if joined is not None else None
+        expired = [
+            self._process_joined(pending)
+            for _, _, pending in self.frame_joiner.drain_expired()
+        ]
+        if output is not None:
+            if expired:
+                output["diagnostics"] = expired
+            return output
+        if expired:
+            return {"kind": "diagnostics", "samples": expired}
+        return None
 
     def process(self, packet: bytes, received_ns: int = 0) -> Optional[dict]:
         meta = packet_meta(packet)
@@ -197,5 +224,10 @@ class PipelineState:
         }
 
     def finish(self):
+        samples = [
+            self._process_joined(pending)
+            for _, _, pending in self.frame_joiner.flush()
+        ]
         for tracker in self.lap_states.values():
             tracker.finish()
+        return samples

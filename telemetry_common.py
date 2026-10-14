@@ -53,6 +53,14 @@ CAR_SETUP_FIELDS = [
 ] + CAR_SETUP_VALUE_FIELDS + ["next_front_wing_value"]
 
 FRAME_JOIN_STREAMS = frozenset({"lap", "motion", "status", "telemetry"})
+MAX_DAMAGE_AGE_FRAMES = 6
+MAX_SETUP_AGE_FRAMES = 29
+MAX_SESSION_AGE_FRAMES = 29
+MAX_AGE_FRAMES = {
+    "damage": MAX_DAMAGE_AGE_FRAMES,
+    "setup": MAX_SETUP_AGE_FRAMES,
+    "session": MAX_SESSION_AGE_FRAMES,
+}
 
 
 class FramePacketJoiner:
@@ -61,13 +69,19 @@ class FramePacketJoiner:
     def __init__(self, max_pending_frames=120):
         self.max_pending_frames = max_pending_frames
         self.pending = {}
+        self.expired = []
 
-    def add(self, session_uid, vehicle_index, frame_id, stream, values):
+    def add(self, session_uid, vehicle_index, frame_id, stream, values, metadata=None):
         if stream not in FRAME_JOIN_STREAMS:
             raise ValueError(f"Unsupported frame-joined stream: {stream}")
         car_key = (session_uid, vehicle_index)
         pending_for_car = self.pending.setdefault(car_key, OrderedDict())
         frame_values = pending_for_car.setdefault(frame_id, {})
+        frame_values.setdefault("_metadata", metadata or {
+            "session_uid": session_uid,
+            "vehicle_index": vehicle_index,
+            "frame_id": frame_id,
+        })
         frame_values[stream] = dict(values)
         pending_for_car.move_to_end(frame_id)
 
@@ -78,22 +92,66 @@ class FramePacketJoiner:
             return joined
 
         while len(pending_for_car) > self.max_pending_frames:
-            pending_for_car.popitem(last=False)
+            expired_frame_id, expired_values = pending_for_car.popitem(last=False)
+            self.expired.append((car_key, expired_frame_id, expired_values))
+        if not pending_for_car:
+            self.pending.pop(car_key)
         return None
+
+    def drain_expired(self):
+        expired = self.expired
+        self.expired = []
+        return expired
+
+    def flush(self):
+        pending = self.drain_expired()
+        for car_key, frames in self.pending.items():
+            for frame_id, values in frames.items():
+                pending.append((car_key, frame_id, values))
+        self.pending.clear()
+        return pending
 
 
 def latest_with_frame_age(values, prefix, current_overall_frame_id):
     """Copy one latest-value cache entry and report its age in overall frames."""
     result = dict(values)
     source_overall_frame_id = result.pop("_overall_frame_id", None)
-    if (
-        source_overall_frame_id is not None
-        and current_overall_frame_id is not None
-    ):
-        result[f"{prefix}_age_frames"] = (
-            current_overall_frame_id - source_overall_frame_id
+    age = None
+    if source_overall_frame_id is not None and current_overall_frame_id is not None:
+        age = max(0, current_overall_frame_id - source_overall_frame_id)
+    if prefix in MAX_AGE_FRAMES:
+        result[f"{prefix}_age_frames"] = age if age is not None else ""
+        result[f"{prefix}_stale"] = (
+            age is None or age > MAX_AGE_FRAMES[prefix]
         )
+    elif age is not None:
+        result[f"{prefix}_age_frames"] = age
     return result
+
+
+def frame_join_metadata(meta, received_ns, damage=None, setup=None, session=None):
+    return {
+        "session_uid": meta.session_uid,
+        "vehicle_index": meta.player_index,
+        "packet_format": meta.packet_format,
+        "session_time_s": meta.session_time_s,
+        "frame_id": meta.frame_id,
+        "overall_frame_id": meta.overall_frame_id,
+        "received_ns": received_ns,
+        "damage": dict(damage or {}),
+        "setup": dict(setup or {}),
+        "session": dict(session or {}),
+    }
+
+
+def mark_sample_completeness(sample, joined):
+    missing = [stream for stream in ("lap", "motion", "status", "telemetry")
+               if stream not in joined]
+    sample["sample_complete"] = not missing
+    sample["missing_streams"] = "|".join(missing)
+    if missing:
+        sample["training_eligible"] = False
+    return sample
 
 
 @dataclass(frozen=True)
