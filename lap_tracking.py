@@ -216,7 +216,11 @@ class SegmentTracker:
             "segment_id": segment["segment_id"],
             "segment_sample_index": segment["segment_sample_index"],
             "segment_valid": segment["segment_valid"] and not bool(sample.get("lap_invalid")),
-            "training_eligible": segment["segment_valid"] and not bool(sample.get("lap_invalid")),
+            "training_eligible": (
+                segment["segment_valid"]
+                and segment["segment_start_reason"] != "flashback_recovery"
+                and not bool(sample.get("lap_invalid"))
+            ),
         })
         if sample.get("lap_invalid"):
             segment["segment_valid"] = False
@@ -248,6 +252,11 @@ class SegmentTracker:
         start_distance = self._value(first, "lap_distance_m")
         end_distance = self._value(last, "lap_distance_m")
         count = segment["sample_count"]
+        training_eligible = (
+            segment["segment_valid"]
+            and count >= MIN_SEGMENT_SAMPLES
+            and segment["segment_start_reason"] != "flashback_recovery"
+        )
         summary = {
             "session_uid": segment["session_uid"],
             "vehicle_index": segment["vehicle_index"],
@@ -264,7 +273,7 @@ class SegmentTracker:
             "segment_start_reason": segment["segment_start_reason"],
             "segment_end_reason": reason,
             "segment_valid": segment["segment_valid"],
-            "training_eligible": segment["segment_valid"] and count >= MIN_SEGMENT_SAMPLES,
+            "training_eligible": training_eligible,
         }
         summary["coverage_distance_m"] = (
             end_distance - start_distance
@@ -291,6 +300,7 @@ class LapTracker:
         self.segment_tracker = SegmentTracker(session_uid, vehicle_index)
         self.summaries = []
         self.flashback_events = []
+        self.completed_lap_numbers = set()
         self.active = False
         self.lap_number: Optional[int] = None
         self.invalid = False
@@ -378,6 +388,7 @@ class LapTracker:
             **conditions,
         }
         self.summaries.append(summary)
+        self.completed_lap_numbers.add(self.lap_number)
         return summary
 
     def process_event(
@@ -405,6 +416,17 @@ class LapTracker:
 
     def process_sample(self, source_sample):
         sample = dict(source_sample)
+        if sample.get("lap_number") in self.completed_lap_numbers:
+            sample.update({
+                "completed_lap_replay": True,
+                "lap_continuous": False,
+                "segment_id": "",
+                "segment_sample_index": "",
+                "segment_valid": False,
+                "training_eligible": False,
+            })
+            return sample, None
+        sample.setdefault("completed_lap_replay", False)
         session_uid = sample.get("session_uid", self.session_uid)
         vehicle_index = sample.get("vehicle_index", self.vehicle_index)
         if self.session_uid is None:

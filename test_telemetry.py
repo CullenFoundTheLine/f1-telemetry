@@ -20,9 +20,12 @@ from receiver import (
     SAMPLE_FIELDS,
     build_braking_event,
     build_telemetry_row,
+    flush_pending_frames,
+    process_complete_sample,
 )
 from telemetry_common import (
     CAR_SETUP,
+    FramePacketJoiner,
     HEADER,
     MAX_DAMAGE_AGE_FRAMES,
     MAX_SESSION_AGE_FRAMES,
@@ -35,13 +38,14 @@ from telemetry_common import (
     decode_session,
     decode_status,
     decode_telemetry,
+    frame_join_metadata,
     classify_compound,
     classify_weather,
     lap_condition_class,
     packet_meta,
     valid_packet,
 )
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 def make_sample(
@@ -466,15 +470,18 @@ class LapAndSegmentTests(unittest.TestCase):
         ]
         segments = [
             {"session_uid": "1", "vehicle_index": "0", "lap_number": "1", "segment_id": "1",
-             "segment_valid": "True", "training_eligible": "True"},
+             "segment_valid": "True", "training_eligible": "True",
+             "segment_start_reason": "lap_start", "segment_end_reason": "lap_complete"},
             {"session_uid": "1", "vehicle_index": "0", "lap_number": "1", "segment_id": "2",
-             "segment_valid": "True", "training_eligible": "False"},
+             "segment_valid": "True", "training_eligible": "False",
+             "segment_start_reason": "lap_start", "segment_end_reason": "lap_complete"},
         ]
         summaries = [{
             "session_uid": "1", "vehicle_index": "0", "lap_number": "1",
             "valid": "True", "complete": "True", "continuous": "True",
             "training_eligible": "True",
             "condition_class": "dry",
+            "segment_count": "1",
         }]
         self.assertEqual(filter_training_rows(rows, segments, summaries), [rows[0]])
         summary_without_conditions = dict(summaries[0])
@@ -491,6 +498,7 @@ class LapAndSegmentTests(unittest.TestCase):
         segment = {
             "session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 1,
             "segment_valid": True, "training_eligible": True,
+            "segment_start_reason": "lap_start", "segment_end_reason": "lap_complete",
         }
         summary = {
             "session_uid": 1, "vehicle_index": 0, "lap_number": 1,
@@ -541,6 +549,81 @@ class LapAndSegmentTests(unittest.TestCase):
         self.assertEqual(
             filter_training_rows(rows, tracker.segments, tracker.summaries), [],
         )
+
+    def test_flashback_replay_rows_are_not_attributed_to_completed_lap(self):
+        tracker = LapTracker(1, 0)
+        source_samples = [
+            make_sample(lap=2, frame=1, current=0.5),
+            make_sample(lap=3, frame=2, current=0.2, distance=0, session_time=10.016),
+            make_sample(lap=3, frame=3, current=0.3, distance=10, session_time=10.032),
+            make_sample(lap=3, frame=4, current=91.8, distance=5000, session_time=10.048),
+            make_sample(lap=4, frame=5, current=0.2, distance=0, session_time=10.064),
+        ]
+        rows = []
+        for sample in source_samples:
+            row, _ = tracker.process_sample(sample)
+            if row is not None:
+                rows.append(row)
+
+        lap_summary = next(
+            summary for summary in tracker.summaries
+            if summary["lap_number"] == 3
+        )
+        self.assertTrue(lap_summary["training_eligible"])
+        original_segment = next(
+            segment for segment in tracker.segments
+            if segment["lap_number"] == 3
+            and segment["segment_start_reason"] == "lap_start"
+        )
+        original_segment_id = original_segment["segment_id"]
+        self.assertEqual(original_segment["segment_end_reason"], "lap_complete")
+
+        tracker.process_event({
+            "event_code": "FLBK",
+            "flashback_frame_id": 4,
+            "flashback_session_time_s": 10.048,
+        })
+        replay, _ = tracker.process_sample(make_sample(
+            lap=3, frame=6, current=91.0, distance=4950, session_time=10.08,
+        ))
+        drive_on, _ = tracker.process_sample(make_sample(
+            lap=4, frame=7, current=0.2, distance=0, session_time=10.096,
+        ))
+        tracker.process_sample(make_sample(
+            lap=4, frame=8, current=0.3, distance=10, session_time=10.112,
+        ))
+        tracker.finish()
+        rows.append(replay)
+        if drive_on is not None:
+            rows.append(drive_on)
+
+        self.assertTrue(replay["completed_lap_replay"])
+        self.assertEqual(replay["segment_id"], "")
+        recovery_segments = [
+            segment for segment in tracker.segments
+            if segment["segment_start_reason"] == "flashback_recovery"
+        ]
+        self.assertEqual(len(recovery_segments), 1)
+        self.assertFalse(recovery_segments[0]["training_eligible"])
+        eligible_rows = filter_training_rows(
+            [
+                {
+                    **row,
+                    "sample_complete": True,
+                    "damage_stale": False,
+                    "session_stale": False,
+                }
+                for row in rows
+            ],
+            tracker.segments,
+            tracker.summaries,
+        )
+        self.assertTrue(eligible_rows)
+        self.assertEqual(
+            {row["segment_id"] for row in eligible_rows},
+            {original_segment_id},
+        )
+
 
     def test_game_invalid_segment_is_ineligible(self):
         tracker = LapTracker(1, 0)
@@ -921,6 +1004,71 @@ class PacketAndOutputTests(unittest.TestCase):
         self.assertEqual(row["motion_received_ns"], 210)
         self.assertEqual(row["damage_frame_id"], 3)
 
+    def test_shutdown_flush_keeps_final_frame_without_lap_as_diagnostic(self):
+        packets = frame_packets()
+        packets = packets[1:]
+        joiner = FramePacketJoiner()
+        for received_ns, packet in enumerate(packets, start=1):
+            meta = packet_meta(packet)
+            joiner.add(
+                meta.session_uid,
+                meta.player_index,
+                meta.frame_id,
+                {0: "motion", 7: "status", 6: "telemetry"}[meta.packet_id],
+                {"frame": meta.frame_id},
+                frame_join_metadata(meta, received_ns),
+            )
+
+        tracker = Mock()
+        diagnostics = []
+
+        def emit(pending):
+            metadata = pending["_metadata"]
+            row = build_telemetry_row(
+                metadata["received_ns"],
+                SimpleNamespace(
+                    packet_format=metadata["packet_format"],
+                    session_uid=metadata["session_uid"],
+                    session_time_s=metadata["session_time_s"],
+                    frame_id=metadata["frame_id"],
+                    overall_frame_id=metadata["overall_frame_id"],
+                    player_index=metadata["vehicle_index"],
+                ),
+                pending.get("lap", {}),
+                pending.get("status", {}),
+                {},
+                pending.get("telemetry", {}),
+                pending.get("motion", {}),
+            )
+            row, completed = process_complete_sample(tracker, row)
+            diagnostics.append(row)
+            self.assertIsNone(completed)
+
+        flush_pending_frames(joiner, emit)
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertFalse(diagnostics[0]["sample_complete"])
+        self.assertEqual(diagnostics[0]["missing_streams"], "lap")
+        self.assertFalse(diagnostics[0]["training_eligible"])
+        tracker.process_sample.assert_not_called()
+
+    def test_blank_lap_number_never_reaches_tracker(self):
+        tracker = Mock()
+        values = {
+            "sample_complete": True,
+            "training_eligible": True,
+            "lap_number": "",
+            "missing_streams": "",
+        }
+
+        row, completed = process_complete_sample(tracker, values)
+
+        self.assertFalse(row["sample_complete"])
+        self.assertFalse(row["training_eligible"])
+        self.assertEqual(row["missing_streams"], "lap")
+        self.assertIsNone(completed)
+        tracker.process_sample.assert_not_called()
+
     def test_braking_events_reset_at_segment_and_lap_boundaries(self):
         rows = [
             {"session_uid": 1, "vehicle_index": 0, "lap_number": 1, "segment_id": 1, "brake_pct": 20},
@@ -1019,6 +1167,7 @@ class PacketAndOutputTests(unittest.TestCase):
         packets = [
             bytes(make_packet(1, frame=0)),
             bytes(make_packet(10, frame=0)),
+            *frame_packets(lap=0, frame=0, session_time=9.0),
         ]
         for frame, session_time, lap, current, last, speed in (
             (1, 10.0, 1, 500, 0, 200),

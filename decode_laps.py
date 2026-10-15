@@ -54,6 +54,7 @@ SAMPLE_FIELDS = [
     "sample_complete", "missing_streams", "damage_stale", "setup_stale",
     "session_stale",
     "lap_continuous", "segment_valid", "training_eligible", "exclusion_reason",
+    "completed_lap_replay",
 ]
 SAMPLE_FIELDS.extend(CAR_SETUP_VALUE_FIELDS + ["next_front_wing_value"])
 for wheel in WHEELS:
@@ -345,33 +346,44 @@ def _key_value(value):
 
 
 def filter_training_rows(rows, segments, summaries):
-    eligible_laps = {
+    summary_by_lap = {
         tuple(_key_value(summary.get(field)) for field in (
             "session_uid", "vehicle_index", "lap_number",
-        ))
+        )): summary
         for summary in summaries
+    }
+    eligible_laps = {
+        key
+        for key, summary in summary_by_lap.items()
         if _is_true(summary.get("valid"))
         and _is_true(summary.get("complete"))
         and _is_true(summary.get("continuous"))
         and _is_true(summary.get("training_eligible"))
         and str(summary.get("condition_class", "")).strip().lower() in {"dry", "wet"}
+        and _key_value(summary.get("segment_count")) == 1
     }
-    eligible_segments = {
-        tuple(_key_value(segment.get(field)) for field in (
+    eligible_segments = set()
+    for segment in segments:
+        segment_key = tuple(_key_value(segment.get(field)) for field in (
             "session_uid", "vehicle_index", "lap_number", "segment_id",
         ))
-        for segment in segments
-        if _is_true(segment.get("segment_valid"))
-        and _is_true(segment.get("training_eligible"))
-        and tuple(_key_value(segment.get(field)) for field in (
-            "session_uid", "vehicle_index", "lap_number",
-        )) in eligible_laps
-    }
+        summary = summary_by_lap.get(segment_key[:3])
+        if (
+            summary is not None
+            and segment_key[:3] in eligible_laps
+            and _key_value(summary.get("segment_count")) == 1
+            and _is_true(segment.get("segment_valid"))
+            and _is_true(segment.get("training_eligible"))
+            and segment.get("segment_start_reason") == "lap_start"
+            and segment.get("segment_end_reason") == "lap_complete"
+        ):
+            eligible_segments.add(segment_key)
     return [
         row for row in rows
         if tuple(_key_value(row.get(field)) for field in (
             "session_uid", "vehicle_index", "lap_number",
         )) in eligible_laps
+        and not _is_true(row.get("completed_lap_replay"))
         and tuple(_key_value(row.get(field)) for field in (
             "session_uid", "vehicle_index", "lap_number", "segment_id",
         )) in eligible_segments

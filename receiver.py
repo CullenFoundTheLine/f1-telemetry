@@ -103,6 +103,38 @@ def build_telemetry_row(
     })
 
 
+def process_complete_sample(tracker, values):
+    if (
+        not values.get("sample_complete")
+        or values.get("lap_number") in (None, "")
+    ):
+        values["sample_complete"] = False
+        values["training_eligible"] = False
+        if values.get("lap_number") in (None, ""):
+            missing = set(filter(None, str(values.get("missing_streams", "")).split("|")))
+            missing.add("lap")
+            values["missing_streams"] = "|".join(
+                stream for stream in ("lap", "motion", "status", "telemetry")
+                if stream in missing
+            )
+        return values, None
+    return tracker.process_sample(values)
+
+
+def flush_pending_frames(frame_joiner, emit_sample):
+    for _, _, pending in frame_joiner.flush():
+        emit_sample(pending)
+
+
+def run_finally_steps(steps):
+    if not steps:
+        return
+    try:
+        steps[0]()
+    finally:
+        run_finally_steps(steps[1:])
+
+
 def build_braking_event(values, previous_brake, previous_key, threshold_pct=5.0):
     key = (
         values.get("session_uid"), values.get("vehicle_index"),
@@ -207,7 +239,6 @@ def main():
                 )
                 received_ns = metadata["received_ns"]
                 key = (meta.session_uid, meta.player_index)
-                tracker = trackers.setdefault(key, LapTracker(*key))
                 values = build_telemetry_row(
                     received_ns,
                     meta,
@@ -228,7 +259,8 @@ def main():
                     })
                     sample_count += 1
                     return
-                values, completed = tracker.process_sample(values)
+                tracker = trackers.setdefault(key, LapTracker(*key))
+                values, completed = process_complete_sample(tracker, values)
                 if values is None:
                     return
                 telemetry_writer.writerow({
@@ -392,14 +424,27 @@ def main():
             except KeyboardInterrupt:
                 print("\nRecording stopped.")
             finally:
-                for _, _, pending in frame_joiner.flush():
-                    emit_joined_sample(pending)
-                for tracker in trackers.values():
-                    tracker.finish()
-                write_live_summaries(lap_file, trackers)
-                write_live_segments(segments_file, trackers)
-                write_live_flashback_events(flashback_file, trackers)
-                raw_file.flush()
+                def finish_trackers():
+                    for tracker in trackers.values():
+                        tracker.finish()
+
+                run_finally_steps((
+                    lambda: flush_pending_frames(
+                        frame_joiner, emit_joined_sample,
+                    ),
+                    finish_trackers,
+                    lambda: write_live_summaries(lap_file, trackers),
+                    lambda: write_live_segments(segments_file, trackers),
+                    lambda: write_live_flashback_events(flashback_file, trackers),
+                    telemetry_file.flush,
+                    position_file.flush,
+                    lap_file.flush,
+                    segments_file.flush,
+                    braking_file.flush,
+                    flashback_file.flush,
+                    setup_file.flush,
+                    raw_file.flush,
+                ))
     finally:
         receiver.close()
         print(f"Raw recording: {raw_path}")

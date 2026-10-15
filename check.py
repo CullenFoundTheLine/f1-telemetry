@@ -11,6 +11,7 @@ decode_laps.py always writes next to raw.bin, plus the git commit if you ask.
 import csv
 import collections
 import re
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,31 @@ def step_sync(folder):
     print(f"[sync]   fast streams on the same frame: {pct:.1f}% of {total} rows")
 
 
+def step_sanity(folder):
+    """Each eligible lap should have about (lap time x sample rate) rows.
+    A lap with far more rows has samples from another stretch of track mixed in."""
+    train = folder / "training_laps.csv"
+    if not train.exists():
+        return
+    per_lap = collections.Counter(r["lap_number"] for r in csv.DictReader(open(train, newline="")))
+    times = {}
+    for r in csv.DictReader(open(folder / "lap_summary.csv", newline="")):
+        if r["training_eligible"] in ("True", "1") and r.get("lap_time_s"):
+            times[r["lap_number"]] = float(r["lap_time_s"])
+    ratios = {lap: n / times[lap] for lap, n in per_lap.items() if times.get(lap)}
+    if not ratios:
+        return
+    med = statistics.median(ratios.values())
+    bad = [(lap, per_lap[lap], round(times[lap] * med)) for lap, x in ratios.items()
+           if abs(x - med) / med > 0.03]
+    print(f"[sanity] typical rate {med:.1f} rows per second of lap time")
+    if bad:
+        for lap, got, want in bad:
+            print(f"         SUSPECT lap {lap}: {got} rows, expected about {want} - do not trust it")
+    else:
+        print("         every eligible lap's row count matches its lap time")
+
+
 def step_commit(message, tests_ok):
     if not tests_ok:
         print("[commit] skipped - tests are failing")
@@ -116,6 +142,7 @@ def main():
         folder = step_replay(raw)
         if folder:
             step_laps(folder)
+            step_sanity(folder)
             step_sync(folder)
     if message:
         step_commit(message, tests_ok)

@@ -145,8 +145,12 @@ def frame_join_metadata(meta, received_ns, damage=None, setup=None, session=None
 
 
 def mark_sample_completeness(sample, joined):
-    missing = [stream for stream in ("lap", "motion", "status", "telemetry")
-               if stream not in joined]
+    missing = [
+        stream for stream in ("lap", "motion", "status", "telemetry")
+        if not joined.get(stream)
+    ]
+    if sample.get("lap_number") in (None, "") and "lap" not in missing:
+        missing.append("lap")
     sample["sample_complete"] = not missing
     sample["missing_streams"] = "|".join(missing)
     if missing:
