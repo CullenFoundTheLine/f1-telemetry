@@ -43,8 +43,9 @@ CAR_SETUP_VALUE_FIELDS = [
     "front_toe", "rear_toe", "front_suspension", "rear_suspension",
     "front_anti_roll_bar", "rear_anti_roll_bar", "front_suspension_height",
     "rear_suspension_height", "brake_pressure_pct", "brake_bias_pct",
-    "engine_braking_pct", "tyre_pressure_rl_psi", "tyre_pressure_rr_psi",
-    "tyre_pressure_fl_psi", "tyre_pressure_fr_psi", "ballast",
+    "engine_braking_pct", "setup_tyre_pressure_rl_psi",
+    "setup_tyre_pressure_rr_psi", "setup_tyre_pressure_fl_psi",
+    "setup_tyre_pressure_fr_psi", "ballast",
     "fuel_load_kg",
 ]
 CAR_SETUP_FIELDS = [

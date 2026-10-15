@@ -98,7 +98,10 @@ def lap_packet(*, lap=1, current_ms=500, last_ms=0, distance=100.0, frame=1,
     return bytes(packet)
 
 
-def telemetry_packet(*, speed=250, session=1, frame=1, player=0, session_time=1.0):
+def telemetry_packet(
+    *, speed=250, session=1, frame=1, player=0, session_time=1.0,
+    pressures=(0.0, 0.0, 0.0, 0.0),
+):
     packet = make_packet(
         6, session=session, frame=frame, player=player, session_time=session_time,
     )
@@ -106,6 +109,8 @@ def telemetry_packet(*, speed=250, session=1, frame=1, player=0, session_time=1.
     struct.pack_into("<HfffBbH", packet, offset, speed, 0.75, -0.25, 0.5, 20, 7, 10000)
     packet[offset + 30] = 70
     packet[offset + 31] = 71
+    pressure_offset = offset + struct.calcsize("<HfffBbHBBH4H4B4BB")
+    struct.pack_into("<4f", packet, pressure_offset, *pressures)
     return bytes(packet)
 
 
@@ -822,6 +827,35 @@ class PacketAndOutputTests(unittest.TestCase):
         self.assertEqual(result["front_camber"], 1.0)
         self.assertEqual(result["fuel_load_kg"], 12.0)
         self.assertEqual(result["next_front_wing_value"], 13.5)
+
+    def test_setup_and_telemetry_tyre_pressures_both_survive_in_row(self):
+        setup_packet = make_packet(5)
+        setup_values = tuple(range(4)) + (
+            1.0, 2.0, 3.0, 4.0,
+        ) + tuple(range(9)) + (
+            20.0, 21.0, 22.0, 23.0, 9, 12.0,
+        )
+        CAR_SETUP.pack_into(setup_packet, HEADER.size, *setup_values)
+        telemetry_pressures = (30.0, 31.0, 32.0, 33.0)
+        telemetry = decode_telemetry(
+            telemetry_packet(pressures=telemetry_pressures), 0,
+        )
+
+        row = build_telemetry_row(
+            0,
+            SimpleNamespace(
+                packet_format=2026, session_uid=1, session_time_s=1.0,
+                frame_id=1, overall_frame_id=1, player_index=0,
+            ),
+            {}, {}, {}, telemetry,
+            setup=decode_car_setup(bytes(setup_packet), 0),
+        )
+
+        for wheel, setup_pressure, telemetry_pressure in zip(
+            WHEELS, setup_values[-6:-2], telemetry_pressures,
+        ):
+            self.assertEqual(row[f"setup_tyre_pressure_{wheel}_psi"], setup_pressure)
+            self.assertEqual(row[f"tyre_pressure_{wheel}_psi"], telemetry_pressure)
 
     def test_pipeline_synchronizes_lap_and_latest_telemetry(self):
         pipeline = PipelineState()

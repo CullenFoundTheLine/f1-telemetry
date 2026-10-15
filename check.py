@@ -114,6 +114,34 @@ def step_sanity(folder):
         print("         every eligible lap's row count matches its lap time")
 
 
+def step_columns(folder):
+    """Catch column-name collisions and dead sensor columns in training_laps.csv."""
+    train = folder / "training_laps.csv"
+    if not train.exists():
+        return
+    with open(train, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        dups = sorted({c for c, n in collections.Counter(header).items() if n > 1})
+        watch = [i for i, c in enumerate(header)
+                 if c.startswith(("tyre_pressure_", "tyre_surface_temp_", "tyre_inner_temp_",
+                                  "brake_temp_", "speed_kmh", "rpm"))]
+        seen = {i: set() for i in watch}
+        for row in reader:
+            for i in watch:
+                if len(seen[i]) < 3:
+                    seen[i].add(row[i])
+    frozen = sorted(header[i] for i, v in seen.items() if len(v) <= 1)
+    problems = []
+    if dups:
+        problems.append("duplicate column names: " + ", ".join(dups))
+    if frozen:
+        problems.append("columns that never change (dead or overwritten?): " + ", ".join(frozen))
+    print("[columns] " + ("OK - no duplicate names, no frozen sensor columns" if not problems else "PROBLEM"))
+    for line in problems:
+        print("          " + line)
+
+
 def step_commit(message, tests_ok):
     if not tests_ok:
         print("[commit] skipped - tests are failing")
@@ -143,6 +171,7 @@ def main():
         if folder:
             step_laps(folder)
             step_sanity(folder)
+            step_columns(folder)
             step_sync(folder)
     if message:
         step_commit(message, tests_ok)
